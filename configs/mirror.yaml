@@ -1,0 +1,21 @@
+mirror:
+  image_side: left          # left | right: ảnh trong gương nằm bên nào của người thật
+  # Không cần normal / d nữa; nếu vẫn ghi normal/d thì chúng được ưu tiên,
+  # trừ khi đặt use_setup: true để ép dùng số đo hiện trường.
+
+setup:
+  camera_to_mirror: 3.49       # AB, đo dọc trục quang học (m)
+  angle_to_mirror_deg: 26.6    # góc giữa trục quang học và MẶT gương
+  camera_height: 1.39
+  walkway_to_mirror: 0.76
+  walkway_length: 6.00
+
+triangulation:
+  sigma_u: [1.0, 1.0]
+  sigma_v_body: [1.0, 1.0]
+  foot_sigma_v: [5.0, 1.0]
+
+reconstruction:
+  min_confidence: 0.2
+  max_reproj_px: 20.0
+  max_gap_s: 0.2
