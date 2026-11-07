@@ -142,6 +142,12 @@ def main() -> int:
     ap.add_argument("--phi_step", type=float, default=1.0)
     ap.add_argument("--min_confidence", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--mirror_edge", type=float, nargs=4, default=None,
+                    metavar=("U1", "V1", "U2", "V2"),
+                    help="Pixel (khung video 1920x1080, chưa gỡ méo) của đáy và "
+                         "đỉnh MỘT cạnh đứng của gương.")
+    ap.add_argument("--mirror_edge_length", type=float, default=None,
+                    help="Độ dài thật của cạnh đó (m); mặc định dimensions.height.")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
@@ -270,6 +276,31 @@ def main() -> int:
                  "chênh %.2f deg).", beta_fit, a_deg, beta_fit - a_deg)
         if cam_height is not None and h0 > 0:
             cands["sàn khớp từ bàn chân"] = D0 * float(cam_height) / h0
+    if args.mirror_edge is not None:
+        h_m = args.mirror_edge_length or (mir_cfg.get("dimensions", {}) or {}).get("height")
+        if not h_m:
+            raise SystemExit("Thiếu độ dài cạnh gương: dùng --mirror_edge_length "
+                             "hoặc dimensions.height trong mirror.yaml.")
+        uv = current.undistort_points(np.asarray(args.mirror_edge, float).reshape(2, 2))
+        rays = np.linalg.solve(K, np.c_[uv, np.ones(2)].T).T  # (2,3)
+        den = rays @ n_best
+        if np.any(den >= 0):
+            LOG.warning("Tia qua điểm click không cắt gương phía trước camera: "
+                        "kiểm tra tọa độ click hoặc dấu n.")
+        v = -rays / den[:, None]  # điểm trên gương = d * v
+        seg = v[0] - v[1]
+        seg_len = float(np.linalg.norm(seg))
+        vec = seg / seg_len
+        if vec[1] < 0:
+            vec = -vec
+        cands["cạnh gương (click)"] = float(h_m) / seg_len
+        a_edge = float(np.degrees(np.arctan2(vec[2], vec[1])))
+        roll_edge = float(np.degrees(np.arcsin(np.clip(vec[0], -1, 1))))
+        LOG.info("Cạnh gương: phương thẳng đứng đo được: chúi %.2f deg, nghiêng "
+                 "ngang (roll) %.2f deg | so sánh: chúi từ n_y %.2f deg%s | "
+                 "|vec.n|=%.3f (nên ~0).", a_edge, roll_edge, np.degrees(alpha),
+                 f", từ bàn chân {beta_fit:.2f} deg" if beta_fit is not None else "",
+                 abs(float(vec @ n_best)))
     if setup.get("camera_to_mirror") is not None:
         cands["thước dây x |n_z|"] = float(setup["camera_to_mirror"]) * abs(n_best[2])
     if setup.get("walkway_length") is not None:
