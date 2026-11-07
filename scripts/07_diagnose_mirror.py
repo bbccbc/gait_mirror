@@ -86,6 +86,21 @@ def fit_epipole(
     return e_px, res_px
 
 
+def point_line_residual(pr: FloatArray, pm: FloatArray, e: FloatArray) -> FloatArray:
+    """Khoảng cách (px) từ điểm gương tới đường (epipole -> điểm thật).
+
+    Đo ngay tại vị trí khớp nên so sánh trực tiếp được với nhiễu detector
+    (khác khoảng cách tới epipole vốn bị khuếch đại khi epipole ở xa).
+    """
+    if abs(e[2]) < 1e-9:
+        return np.full(len(pr), np.nan)
+    e2 = e[:2] / e[2]
+    v1 = pr - e2
+    v2 = pm - e2
+    cross = np.abs(v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0])
+    return cross / np.maximum(np.linalg.norm(v1, axis=1), 1e-9)
+
+
 def prepare(
     pts: FloatArray, conf: FloatArray, interp: FloatArray,
     min_conf: float, n_points: int, seed: int,
@@ -168,7 +183,8 @@ def main() -> int:
     results = {}
     for swap in (False, True):
         p_sub, c_sub, jj = build(swap)
-        e, res = fit_epipole(p_sub[:, 0], p_sub[:, 1], center)
+        e, _ = fit_epipole(p_sub[:, 0], p_sub[:, 1], center)
+        res = point_line_residual(p_sub[:, 0], p_sub[:, 1], e)
         n_e = np.linalg.solve(K, e)
         n_e /= np.linalg.norm(n_e)
         if n_e[2] > 0:
@@ -188,11 +204,11 @@ def main() -> int:
             "Hoán đổi trái-phải của mirror_kpts đồng quy tốt hơn hẳn: bước gán "
             "real/mirror có vẻ lật SAI (chưa lật, hoặc lật hai lần)."
         )
-    if med > 8.0:
+    if med > 5.0:
         LOG.warning(
-            "Các đường nối real-mirror KHÔNG đồng quy (median %.1f px): ghép cặp "
-            "điểm/nhầm người ở nhiều khung hình, hoặc K/méo sai. Hãy sửa dữ liệu "
-            "2D trước, thông số gương chưa phải vấn đề.", med,
+            "Các đường nối real-mirror KHÔNG đồng quy (median %.1f px tại vị trí "
+            "khớp, ngưỡng tốt ~1-3 px): ghép cặp điểm/nhầm người ở nhiều khung "
+            "hình, hoặc K/méo sai.", med,
         )
 
     # ---- Kiểm tra 2: quét phi + n từ epipole ----
@@ -217,30 +233,56 @@ def main() -> int:
              "| cấu hình hiện tại -> %.2f px", phi_best, c_sweep[0], c_epi[0], c_cfg[0])
     n_best, c_best = (n_epi, c_epi) if c_epi[0] < c_sweep[0] else (n_sweep, c_sweep)
 
-    # ---- d từ chiều cao camera ----
+    # ---- d: so sánh nhiều nguồn độc lập (sai số tái chiếu không phụ thuộc d) ----
     _, frac, X, ok = c_best
+    LOG.info("Valid %.0f%% (điểm trước gương và trước camera).", 100 * frac)
+    mean_term = float(np.mean(X[ok] @ n_best + D0))  # khoảng cách tới gương, d=D0
+    cands: Dict[str, float] = {}
     foot = np.isin(jj, FOOT_IDS) & ok
+    y_med = float(np.median(X[foot, 1])) if foot.sum() >= 20 else float("nan")
+    if cam_height is not None and y_med > 0:
+        cands["sàn Y=camera_height"] = D0 * float(cam_height) / y_med
+    if setup.get("walkway_length") is not None:
+        m_arr = mirror[:, perm] if swap_best else mirror
+        ur = current.undistort_points(real[..., :2])
+        um = current.undistort_points(m_arr[..., :2])
+        hip = np.stack([ur[:, [11, 12]], um[:, [11, 12]]], axis=2)  # (T,2,2v,2)
+        cf = np.stack([real[..., 2], m_arr[..., 2]], axis=2)[:, [11, 12]]
+        good_t = np.isfinite(hip).all(axis=(1, 2, 3)) & (
+            np.nan_to_num(cf, nan=0.0) >= args.min_confidence).all(axis=(1, 2))
+        if good_t.sum() >= 30:
+            sys_h = MirrorCameraSystem(K, n_best, D0)
+            hp = hip[good_t].reshape(-1, 2, 2)
+            rh = triangulate_points_dlt(sys_h.projection_matrices, hp, None, tri_cfg)
+            pts_h = rh.points_3d.reshape(-1, 2, 3)
+            ok_h = rh.valid.reshape(-1, 2).all(axis=1) & rh.in_front.reshape(-1, 2).all(axis=1)
+            mid = pts_h[ok_h].mean(axis=1)
+            if len(mid) >= 30:
+                c = mid - mid.mean(axis=0)
+                axis = np.linalg.svd(c, full_matrices=False)[2][0]
+                proj = c @ axis
+                extent = float(np.percentile(proj, 98) - np.percentile(proj, 2))
+                if extent > 1e-6:
+                    cands["chiều dài đường đi"] = D0 * float(setup["walkway_length"]) / extent
+    if current.d > 0:
+        cands["thước dây (cấu hình)"] = float(current.d)
+    LOG.info("%-24s %9s %22s %20s", "Nguồn d", "d (m)", "khoảng cách tới gương", "Y bàn chân (m)")
+    for name, dv in cands.items():
+        sc = dv / D0
+        LOG.info("%-24s %9.3f %22.3f %20.3f", name, dv, sc * mean_term,
+                 sc * y_med if np.isfinite(y_med) else float("nan"))
+    LOG.info("Kỳ vọng: khoảng cách tới gương %s m, Y bàn chân %s m. Nếu các nguồn "
+             "không khớp nhau (±10%%) thì một giả định đang sai.", walkway, cam_height)
     d_est: Optional[float] = None
-    if cam_height is not None and foot.sum() >= 20:
-        y_med = float(np.median(X[foot, 1]))
-        if y_med > 0:
-            scale = float(cam_height) / y_med
-            d_est = D0 * scale
-            dist = (X[ok] * scale) @ n_best + d_est
-            LOG.info("Tỉ lệ từ sàn %.4f => d = %.4f m | khoảng cách TB người-gương "
-                     "%.3f m (kỳ vọng %s)", scale, d_est, float(dist.mean()), walkway)
-        else:
-            LOG.warning("Y bàn chân trung vị <= 0: hình học vẫn chưa hợp lệ.")
     if c_best[0] > 3.0:
         LOG.warning("Reproj tối thiểu vẫn %.1f px: chưa tin được n, d bên dưới.",
                     c_best[0])
 
-    print("\n--- Đề xuất cho configs/mirror.yaml (chỉ dùng nếu reproj <~ 3 px) ---")
-    print(f"# hoán đổi trái-phải mirror_kpts: {'CÓ' if swap_best else 'không'}")
+    print("\n--- Đề xuất cho configs/mirror.yaml ---")
+    print(f"# hoán đổi trái-phải mirror_kpts: {'CÓ -> chạy 03 với --hypothesis swap' if swap_best else 'không'}")
     print("mirror:")
     print(f"  normal: [{n_best[0]:.4f}, {n_best[1]:.4f}, {n_best[2]:.4f}]")
-    if d_est is not None:
-        print(f"  d: {d_est:.4f}")
+    print(f"  d: {current.d:.4f}   # sai số tái chiếu không phụ thuộc d; xem bảng nguồn d ở trên")
     return 0
 
 
