@@ -317,11 +317,19 @@ def main() -> int:
         # Sàn: n_g vuông góc n_m, không roll => n_g = (0, cos a, sin a) với
         # tan a = -n_y/n_z (a = độ chúi của camera). Chiều cao tại điểm X so với
         # camera = X . n_g (bằng Y khi camera nằm ngang). Sàn ở X . n_g = h.
-        nm = system.normal
-        alpha = float(np.arctan(-nm[1] / nm[2])) if abs(nm[2]) > 1e-6 else 0.0
-        n_g = np.array([0.0, np.cos(alpha), np.sin(alpha)])
-        LOG.info("Camera chúi ~%.1f deg; n_g=%s", np.degrees(alpha),
-                 np.round(n_g, 3).tolist())
+        vd = (mir_cfg.get("mirror", mir_cfg) or {}).get("vertical_down")
+        if vd is not None:
+            n_g = np.asarray(vd, dtype=np.float64).reshape(3)
+            n_g = n_g / np.linalg.norm(n_g)
+            LOG.info("n_g từ mirror.vertical_down (đo từ cạnh gương): %s",
+                     np.round(n_g, 4).tolist())
+        else:
+            nm = system.normal
+            alpha = float(np.arctan(-nm[1] / nm[2])) if abs(nm[2]) > 1e-6 else 0.0
+            n_g = np.array([0.0, np.cos(alpha), np.sin(alpha)])
+            LOG.warning("Không có mirror.vertical_down: giả định camera KHÔNG roll, "
+                        "chúi %.1f deg (suy từ n_y). Chạy 03a với --mirror_edge.",
+                        np.degrees(alpha))
         with np.errstate(invalid="ignore"):
             height = pose @ n_g
             below = height > float(floor_y) + floor_tol

@@ -254,11 +254,12 @@ def main() -> int:
              np.round(n_g, 3).tolist())
     y_med = float(np.median(X[foot] @ n_g)) if foot.sum() >= 20 else float("nan")
     if cam_height is not None and y_med > 0:
-        cands["sàn (có xét chúi)"] = D0 * float(cam_height) / y_med
+        cands["sàn (giả định không roll)"] = D0 * float(cam_height) / y_med
     # Khớp mặt sàn trực tiếp từ bàn chân (không dựa vào n_y): bàn chân chạm sàn
     # tạo cụm điểm rất hẹp theo pháp tuyến sàn; chọn beta làm đuôi trên của
     # phân bố g = X . n_g(beta) hẹp nhất (p95 - p70), mức sàn = p90.
     beta_fit: Optional[float] = None
+    vertical_down: Optional[FloatArray] = None
     if foot.sum() >= 200:
         gp = X[foot]
         a_deg = float(np.degrees(alpha))
@@ -296,11 +297,17 @@ def main() -> int:
         cands["cạnh gương (click)"] = float(h_m) / seg_len
         a_edge = float(np.degrees(np.arctan2(vec[2], vec[1])))
         roll_edge = float(np.degrees(np.arcsin(np.clip(vec[0], -1, 1))))
-        LOG.info("Cạnh gương: phương thẳng đứng đo được: chúi %.2f deg, nghiêng "
-                 "ngang (roll) %.2f deg | so sánh: chúi từ n_y %.2f deg%s | "
-                 "|vec.n|=%.3f (nên ~0).", a_edge, roll_edge, np.degrees(alpha),
-                 f", từ bàn chân {beta_fit:.2f} deg" if beta_fit is not None else "",
-                 abs(float(vec @ n_best)))
+        LOG.info("Cạnh gương: hướng thẳng đứng (xuống) trong hệ camera = %s | chúi "
+                 "%.2f deg, nghiêng ngang (roll) %.2f deg | so sánh: chúi từ n_y "
+                 "(giả định không roll) %.2f deg%s.", np.round(vec, 4).tolist(),
+                 a_edge, roll_edge, np.degrees(alpha),
+                 f", từ bàn chân {beta_fit:.2f} deg" if beta_fit is not None else "")
+        vertical_down = vec
+        # Pháp tuyến sàn = phương thẳng đứng đo được (có roll)
+        n_g = vec
+        y_med = float(np.median(X[foot] @ n_g)) if foot.sum() >= 20 else float("nan")
+        if cam_height is not None and y_med > 0:
+            cands["sàn (vertical từ cạnh gương)"] = D0 * float(cam_height) / y_med
     if setup.get("camera_to_mirror") is not None:
         cands["thước dây x |n_z|"] = float(setup["camera_to_mirror"]) * abs(n_best[2])
     if setup.get("walkway_length") is not None:
@@ -339,11 +346,15 @@ def main() -> int:
         LOG.warning("Reproj tối thiểu vẫn %.1f px: chưa tin được n, d bên dưới.",
                     c_best[0])
 
+    d_out = cands.get("cạnh gương (click)", current.d)
     print("\n--- Đề xuất cho configs/mirror.yaml ---")
     print(f"# hoán đổi trái-phải mirror_kpts: {'CÓ -> chạy 03 với --hypothesis swap' if swap_best else 'không'}")
     print("mirror:")
     print(f"  normal: [{n_best[0]:.4f}, {n_best[1]:.4f}, {n_best[2]:.4f}]")
-    print(f"  d: {current.d:.4f}   # sai số tái chiếu không phụ thuộc d; xem bảng nguồn d ở trên")
+    print(f"  d: {d_out:.4f}" + ("   # từ cạnh gương (click)" if "cạnh gương (click)" in cands else "   # CHƯA đo: dùng --mirror_edge"))
+    if vertical_down is not None:
+        print("  vertical_down: [" + ", ".join(f"{v:.4f}" for v in vertical_down) +
+              "]   # hướng thẳng đứng (xuống) trong hệ camera, dùng cho sàn")
     return 0
 
 
