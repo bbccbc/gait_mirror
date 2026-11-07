@@ -239,9 +239,18 @@ def main() -> int:
     mean_term = float(np.mean(X[ok] @ n_best + D0))  # khoảng cách tới gương, d=D0
     cands: Dict[str, float] = {}
     foot = np.isin(jj, FOOT_IDS) & ok
-    y_med = float(np.median(X[foot, 1])) if foot.sum() >= 20 else float("nan")
+    # Mặt sàn: n_g vuông góc n_m, không roll => n_g = (0, cos a, sin a),
+    # tan a = -n_y / n_z  (a = độ chúi xuống của camera, giả định gương thẳng đứng)
+    alpha = float(np.arctan(-n_best[1] / n_best[2])) if abs(n_best[2]) > 1e-6 else 0.0
+    n_g = np.array([0.0, np.cos(alpha), np.sin(alpha)])
+    LOG.info("Camera chúi xuống ~%.1f deg (suy từ n_y; giả định gương thẳng "
+             "đứng, không roll). Pháp tuyến sàn n_g=%s", np.degrees(alpha),
+             np.round(n_g, 3).tolist())
+    y_med = float(np.median(X[foot] @ n_g)) if foot.sum() >= 20 else float("nan")
     if cam_height is not None and y_med > 0:
-        cands["sàn Y=camera_height"] = D0 * float(cam_height) / y_med
+        cands["sàn (có xét chúi)"] = D0 * float(cam_height) / y_med
+    if setup.get("camera_to_mirror") is not None:
+        cands["thước dây x |n_z|"] = float(setup["camera_to_mirror"]) * abs(n_best[2])
     if setup.get("walkway_length") is not None:
         m_arr = mirror[:, perm] if swap_best else mirror
         ur = current.undistort_points(real[..., :2])
@@ -265,13 +274,13 @@ def main() -> int:
                 if extent > 1e-6:
                     cands["chiều dài đường đi"] = D0 * float(setup["walkway_length"]) / extent
     if current.d > 0:
-        cands["thước dây (cấu hình)"] = float(current.d)
-    LOG.info("%-24s %9s %22s %20s", "Nguồn d", "d (m)", "khoảng cách tới gương", "Y bàn chân (m)")
+        cands["d trong cấu hình"] = float(current.d)
+    LOG.info("%-24s %9s %22s %20s", "Nguồn d", "d (m)", "khoảng cách tới gương", "cao camera (m)")
     for name, dv in cands.items():
         sc = dv / D0
         LOG.info("%-24s %9.3f %22.3f %20.3f", name, dv, sc * mean_term,
                  sc * y_med if np.isfinite(y_med) else float("nan"))
-    LOG.info("Kỳ vọng: khoảng cách tới gương %s m, Y bàn chân %s m. Nếu các nguồn "
+    LOG.info("Kỳ vọng: khoảng cách tới gương %s m, cao camera %s m. Nếu các nguồn "
              "không khớp nhau (±10%%) thì một giả định đang sai.", walkway, cam_height)
     d_est: Optional[float] = None
     if c_best[0] > 3.0:

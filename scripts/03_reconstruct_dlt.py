@@ -314,19 +314,29 @@ def main() -> int:
 
     n_below_floor = 0
     if floor_y is not None:
+        # Sàn: n_g vuông góc n_m, không roll => n_g = (0, cos a, sin a) với
+        # tan a = -n_y/n_z (a = độ chúi của camera). Chiều cao tại điểm X so với
+        # camera = X . n_g (bằng Y khi camera nằm ngang). Sàn ở X . n_g = h.
+        nm = system.normal
+        alpha = float(np.arctan(-nm[1] / nm[2])) if abs(nm[2]) > 1e-6 else 0.0
+        n_g = np.array([0.0, np.cos(alpha), np.sin(alpha)])
+        LOG.info("Camera chúi ~%.1f deg; n_g=%s", np.degrees(alpha),
+                 np.round(n_g, 3).tolist())
         with np.errstate(invalid="ignore"):
-            below = pose[..., 1] > float(floor_y) + floor_tol
+            height = pose @ n_g
+            below = height > float(floor_y) + floor_tol
         n_below_floor = int(below.sum())
         if n_below_floor:
-            LOG.warning("%d điểm xuyên sàn (Y > %.3f + %.2f m); policy=%s.",
-                        n_below_floor, float(floor_y), floor_tol, floor_policy)
+            LOG.warning("%d điểm xuyên sàn (cao hơn mặt sàn > %.2f m); policy=%s.",
+                        n_below_floor, floor_tol, floor_policy)
             if floor_policy == "drop":
                 pose[below] = np.nan
                 reproj[below] = np.nan
             elif floor_policy == "clamp":
                 with np.errstate(invalid="ignore"):
-                    over = pose[..., 1] > float(floor_y)
-                pose[..., 1] = np.where(over, float(floor_y), pose[..., 1])
+                    over = height > float(floor_y)
+                shift = np.where(over, height - float(floor_y), 0.0)
+                pose = pose - shift[..., None] * n_g
 
     pose, filled = fill_short_gaps(pose, int(round(max_gap_s * fps)))
     valid_final = np.isfinite(pose).all(axis=2)
