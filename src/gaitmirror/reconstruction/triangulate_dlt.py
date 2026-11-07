@@ -1,333 +1,395 @@
-"""Tam giác hóa đa view: Hartley-normalized DLT + Levenberg-Marquardt.
+#!/usr/bin/env python3
+"""Giai đoạn 2A: dựng 3D từ camera thật + camera ảo (gương) bằng DLT + LM.
 
-Thứ tự view trong toàn bộ module: view 0 = người thật, view 1 = gương.
-Mọi hàm đều vector hóa theo số điểm N.
+Chọn giả thuyết gán nhãn trái-phải của mirror_kpts THEO TỪNG KHUNG:
+  A = giữ nguyên (mirror_kpts_raw), B = hoán đổi các cặp đối xứng.
+Cả hai được tam giác hóa; chi phí mỗi khung = median sai số tái chiếu (px) +
+phạt khớp không hợp lệ (kể cả điểm nằm sau gương). Bộ giải Viterbi 2 trạng
+thái với phạt chuyển đổi chọn chuỗi giả thuyết tối ưu (nhãn thường giữ ổn
+định qua nhiều khung rồi mới đổi).
 
-Cực tiểu hóa::
+Ví dụ::
 
-    min_X  sum_v (x_v - pi(P_v, X))^T Sigma_v^{-1} (x_v - pi(P_v, X)),
-    Sigma_v = diag(sigma_u^2, sigma_v^2)
+    python scripts/03_reconstruct_dlt.py \\
+        --input_npz data/interim/assigned_2d/IMG_8380_filtered.npz \\
+        --config_camera configs/camera.yaml \\
+        --config_mirror configs/mirror.yaml \\
+        --output_dir data/interim/poses_3d/dlt
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields
-from typing import Any, Mapping, Optional, Sequence, Tuple
+import argparse
+import json
+import logging
+import sys
+import warnings
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from numpy.typing import ArrayLike, NDArray
+import yaml
+from numpy.typing import NDArray
 
+_SRC = Path(__file__).resolve().parents[1] / "src"
+if _SRC.is_dir() and str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from gaitmirror.reconstruction.mirror_camera import MirrorCameraSystem  # noqa: E402
+from gaitmirror.reconstruction.triangulate_dlt import (  # noqa: E402
+    TriangulationConfig,
+    build_sigmas,
+    triangulate_points_dlt,
+)
+
+LOG = logging.getLogger("reconstruct_dlt")
 FloatArray = NDArray[np.float64]
 BoolArray = NDArray[np.bool_]
 
-N_VIEWS_DEFAULT = 2  # [real, mirror]
+N_JOINTS = 23
+IMAGE_SIZE = (1920, 1080)
+# Quy ước 23 điểm: COCO-17 + [LBT, LST, LH, RBT, RST, RH] (17..22)
+DEFAULT_LR_PAIRS: List[Tuple[int, int]] = [
+    (1, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (13, 14), (15, 16),
+    (17, 20), (18, 21), (19, 22),
+]
+COST_CAP_PX = 60.0
 
 
-@dataclass
-class TriangulationConfig:
-    """Siêu tham số tam giác hóa. Mọi sigma tính bằng pixel.
-
-    Các tuple sigma có thứ tự (real, mirror).
-    `foot_*` áp dụng cho các khớp trong `foot_joints` (chống bias bóng sàn):
-    đặt foot_sigma_v > foot_sigma_u để giảm trọng số sai số theo phương dọc ảnh.
-    """
-
-    sigma_u: Tuple[float, float] = (1.0, 1.0)
-    sigma_v: Tuple[float, float] = (1.0, 1.0)
-    foot_sigma_u: Optional[Tuple[float, float]] = None  # None -> dùng sigma_u
-    foot_sigma_v: Tuple[float, float] = (3.0, 3.0)
-    foot_joints: Tuple[int, ...] = (17, 18, 19, 20, 21, 22)
-    use_confidence: bool = True
-    conf_floor: float = 0.05
-    interp_sigma_scale: float = 2.0  # nhân sigma cho điểm nội suy
-    max_iters: int = 30
-    lm_lambda0: float = 1e-3
-    step_tol: float = 1e-8  # mét
-    refine: bool = True
-
-    @classmethod
-    def from_dict(cls, cfg: Optional[Mapping[str, Any]]) -> "TriangulationConfig":
-        if not cfg:
-            return cls()
-        kw = dict(cfg)
-        if "sigma_v_body" in kw:  # alias: sigma_v của thân trên + chân (0..16)
-            kw["sigma_v"] = kw.pop("sigma_v_body")
-        names = {f.name for f in fields(cls)}
-        unknown = set(kw) - names
-        if unknown:
-            raise KeyError(f"Khóa triangulation không hợp lệ: {sorted(unknown)}")
-        for key in ("sigma_u", "sigma_v", "foot_sigma_u", "foot_sigma_v"):
-            if key in kw and kw[key] is not None:
-                val = kw[key]
-                kw[key] = (
-                    (float(val), float(val))
-                    if np.isscalar(val)
-                    else (float(val[0]), float(val[1]))
-                )
-        if "foot_joints" in kw:
-            kw["foot_joints"] = tuple(int(j) for j in kw["foot_joints"])
-        return cls(**kw)
+def load_yaml(path: Path) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: YAML phải là mapping ở cấp cao nhất.")
+    return data
 
 
-@dataclass
-class TriangulationResult:
-    """Kết quả tam giác hóa cho N điểm, V view."""
+def lr_permutation(pairs: Sequence[Tuple[int, int]]) -> NDArray[np.int64]:
+    perm = np.arange(N_JOINTS)
+    for a, b in pairs:
+        perm[a], perm[b] = b, a
+    return perm
 
-    points_3d: FloatArray  # (N, 3) mét; NaN nếu không dựng được
-    residuals: FloatArray  # (N, V, 2) pixel có dấu (quan sát - dự đoán)
-    reproj_error: FloatArray  # (N, V) pixel, chuẩn L2
-    cost: FloatArray  # (N,) tổng bình phương residual đã whiten
-    converged: BoolArray  # (N,)
-    in_front: BoolArray  # (N,) độ sâu > 0 ở mọi view
-    valid: BoolArray  # (N,) dựng thành công
-    extras: dict = field(default_factory=dict)
+
+def fill_short_gaps(pose: FloatArray, max_gap: int) -> Tuple[FloatArray, BoolArray]:
+    """Nội suy tuyến tính 3D cho đoạn NaN ngắn (<= max_gap) có hai đầu hợp lệ."""
+    out = pose.copy()
+    filled = np.zeros(pose.shape[:2], dtype=bool)
+    if max_gap <= 0:
+        return out, filled
+    for j in range(pose.shape[1]):
+        valid_idx = np.flatnonzero(np.isfinite(pose[:, j]).all(axis=1))
+        for a, b in zip(valid_idx[:-1], valid_idx[1:]):
+            gap = b - a - 1
+            if 0 < gap <= max_gap:
+                t = np.arange(a + 1, b)
+                alpha = ((t - a) / (b - a))[:, None]
+                out[t, j] = (1 - alpha) * pose[a, j] + alpha * pose[b, j]
+                filled[t, j] = True
+    return out, filled
+
+
+def _nanmean(x: FloatArray, axis: int = 0) -> FloatArray:
+    cnt = np.isfinite(x).sum(axis=axis)
+    tot = np.nansum(x, axis=axis)
+    return np.where(cnt > 0, tot / np.maximum(cnt, 1), np.nan)
 
 
 # ---------------------------------------------------------------------- #
-# Sigma
+# Một giả thuyết: tam giác hóa toàn chuỗi
 # ---------------------------------------------------------------------- #
-def build_sigmas(
-    joint_ids: NDArray[np.integer],
-    confidences: Optional[FloatArray],
-    interpolated: Optional[BoolArray],
-    config: TriangulationConfig,
+def run_hypothesis(
+    system: MirrorCameraSystem,
+    tri_cfg: TriangulationConfig,
+    real: FloatArray,
+    mirror: FloatArray,
+    real_mask: BoolArray,
+    mirror_mask: BoolArray,
+    und_real: FloatArray,
+    min_conf: float,
+    max_reproj: float,
+    require_front: bool,
+) -> Dict[str, FloatArray]:
+    """Tam giác hóa (T,J) điểm cho một cấu hình mirror. Trả về dict mảng."""
+    t_len = real.shape[0]
+    und_mirror = system.undistort_points(mirror[..., :2])
+    pts = np.stack([und_real, und_mirror], axis=2)  # (T,J,2,2)
+    conf = np.stack([real[..., 2], mirror[..., 2]], axis=2)  # (T,J,2)
+    interp = np.stack([real_mask, mirror_mask], axis=2)
+    low = (~interp) & (np.nan_to_num(conf, nan=0.0) < min_conf)
+    pts = np.where(low[..., None], np.nan, pts)
+
+    joint_ids = np.tile(np.arange(N_JOINTS), t_len)
+    sig = build_sigmas(joint_ids, conf.reshape(-1, 2), interp.reshape(-1, 2), tri_cfg)
+    res = triangulate_points_dlt(
+        system.projection_matrices, pts.reshape(-1, 2, 2), sig, tri_cfg
+    )
+    keep = res.valid & res.in_front
+    keep &= np.nan_to_num(res.reproj_error, nan=np.inf).max(axis=1) <= max_reproj
+    pose = res.points_3d.reshape(t_len, N_JOINTS, 3).copy()
+    if require_front:
+        with np.errstate(invalid="ignore"):
+            side = pose @ system.normal + system.d > 0.0
+        keep = keep.reshape(t_len, N_JOINTS) & side
+    else:
+        keep = keep.reshape(t_len, N_JOINTS)
+    reproj = res.reproj_error.reshape(t_len, N_JOINTS, 2).copy()
+    pose[~keep] = np.nan
+    reproj[~keep] = np.nan
+    return {"pose": pose, "reproj": reproj, "keep": keep}
+
+
+def frame_costs(
+    reproj: FloatArray, keep: BoolArray, min_joints: int, invalid_penalty: float
 ) -> FloatArray:
-    """Tạo mảng sigma (N, V, 2) = (sigma_u, sigma_v) cho từng điểm/view.
+    """Chi phí mỗi khung (px): median sai số + phạt tỉ lệ khớp không hợp lệ."""
+    err = np.where(keep, reproj.mean(axis=2), np.nan)
+    n_valid = keep.sum(axis=1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        med = np.nanmedian(err, axis=1)
+    cost = med + invalid_penalty * (1.0 - n_valid / keep.shape[1])
+    cost = np.where(n_valid >= min_joints, cost, COST_CAP_PX)
+    return np.minimum(np.nan_to_num(cost, nan=COST_CAP_PX), COST_CAP_PX)
 
-    Args:
-        joint_ids: (N,) chỉ số khớp của mỗi điểm.
-        confidences: (N, V) độ tin cậy detector, hoặc None.
-        interpolated: (N, V) True nếu điểm do nội suy, hoặc None.
+
+def viterbi_two_state(costs: FloatArray, switch_penalty: float) -> BoolArray:
+    """Chọn chuỗi trạng thái {0,1} cực tiểu tổng chi phí + phạt mỗi lần đổi.
+
+    costs: (T, 2). Trả về mảng bool (T,): True = trạng thái 1 (hoán đổi).
     """
-    n = joint_ids.shape[0]
-    v = N_VIEWS_DEFAULT
-    su = np.broadcast_to(np.asarray(config.sigma_u, float), (n, v)).copy()
-    sv = np.broadcast_to(np.asarray(config.sigma_v, float), (n, v)).copy()
+    t_len = costs.shape[0]
+    dp = costs[0].copy()
+    back = np.zeros((t_len, 2), dtype=np.int64)
+    for t in range(1, t_len):
+        new = np.empty(2)
+        for h in (0, 1):
+            stay, switch = dp[h], dp[1 - h] + switch_penalty
+            if switch < stay:
+                back[t, h], best = 1 - h, switch
+            else:
+                back[t, h], best = h, stay
+            new[h] = best + costs[t, h]
+        dp = new
+    state = np.zeros(t_len, dtype=np.int64)
+    state[-1] = int(np.argmin(dp))
+    for t in range(t_len - 1, 0, -1):
+        state[t - 1] = back[t, state[t]]
+    return state.astype(bool)
 
-    foot = np.isin(joint_ids, np.asarray(config.foot_joints, dtype=int))
-    fu = config.foot_sigma_u if config.foot_sigma_u is not None else config.sigma_u
-    su[foot] = np.asarray(fu, float)
-    sv[foot] = np.asarray(config.foot_sigma_v, float)
 
-    scale = np.ones((n, v))
-    if config.use_confidence and confidences is not None:
-        conf = np.clip(np.nan_to_num(confidences, nan=0.0), config.conf_floor, 1.0)
-        scale = scale / np.sqrt(conf)
-    if interpolated is not None:
-        scale = np.where(interpolated, scale * config.interp_sigma_scale, scale)
-    return np.stack([su * scale, sv * scale], axis=-1)
+def build_summary(
+    reproj: FloatArray, valid: BoolArray, filled: BoolArray, fps: float
+) -> Dict[str, Any]:
+    return {
+        "n_frames": int(reproj.shape[0]),
+        "fps": float(fps),
+        "mean_reproj_real_px": _nanmean(reproj[..., 0]).tolist(),
+        "mean_reproj_mirror_px": _nanmean(reproj[..., 1]).tolist(),
+        "mean_reproj_real_all_px": float(_nanmean(reproj[..., 0].ravel())),
+        "mean_reproj_mirror_all_px": float(_nanmean(reproj[..., 1].ravel())),
+        "valid_ratio_per_joint": valid.mean(axis=0).tolist(),
+        "gap_filled_ratio_per_joint": filled.mean(axis=0).tolist(),
+    }
 
 
-# ---------------------------------------------------------------------- #
-# Hartley normalization + DLT
-# ---------------------------------------------------------------------- #
-def hartley_normalization(pts: FloatArray) -> FloatArray:
-    """Ma trận T (3x3) đưa tập điểm 2D về mean 0, khoảng cách TB = sqrt(2).
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--input_npz", type=Path, required=True)
+    p.add_argument("--config_camera", type=Path, required=True)
+    p.add_argument("--config_mirror", type=Path, required=True)
+    p.add_argument("--output_dir", type=Path,
+                   default=Path("data/interim/poses_3d/dlt"))
+    p.add_argument("--hypothesis", choices=["dual", "raw", "swap"], default="dual",
+                   help="dual: chọn theo khung; raw: luôn giữ nguyên; "
+                        "swap: luôn hoán đổi trái-phải.")
+    p.add_argument("--mirror_key", choices=["auto", "raw", "mirror_kpts"],
+                   default="auto", help="Khóa mirror trong npz (auto ưu tiên raw).")
+    p.add_argument("--switch_penalty", type=float, default=None,
+                   help="Phạt (px) mỗi lần đổi giả thuyết giữa hai khung liền kề.")
+    p.add_argument("--min_confidence", type=float, default=None)
+    p.add_argument("--max_reproj_px", type=float, default=None)
+    p.add_argument("--max_gap_s", type=float, default=None)
+    p.add_argument("-v", "--verbose", action="store_true")
+    return p.parse_args()
 
-    Phải tính trên *tập nhiều điểm* của cùng một view (cả chuỗi video), không
-    tính riêng cho từng điểm (khi đó sẽ suy biến).
-    """
-    mean = pts.mean(axis=0)
-    dist = np.linalg.norm(pts - mean, axis=1).mean()
-    s = np.sqrt(2.0) / max(dist, 1e-12)
-    return np.array(
-        [[s, 0.0, -s * mean[0]], [0.0, s, -s * mean[1]], [0.0, 0.0, 1.0]]
+
+def main() -> int:
+    args = parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
     )
 
-
-def _dlt_linear(
-    P_norm: FloatArray, x_norm: FloatArray, sig_norm: FloatArray
-) -> Tuple[FloatArray, BoolArray]:
-    """DLT tuyến tính (đã chuẩn hóa) cho M điểm. Trả về X (M,3), ok (M,)."""
-    m, v, _ = x_norm.shape
-    A = np.empty((m, 2 * v, 4))
-    for i in range(v):
-        p1, p2, p3 = P_norm[i, 0], P_norm[i, 1], P_norm[i, 2]
-        A[:, 2 * i] = (x_norm[:, i, 0:1] * p3 - p1) / sig_norm[:, i, 0:1]
-        A[:, 2 * i + 1] = (x_norm[:, i, 1:2] * p3 - p2) / sig_norm[:, i, 1:2]
-    _, _, vt = np.linalg.svd(A)
-    Xh = vt[:, -1, :]
-    w = Xh[:, 3]
-    ok = np.abs(w) > 1e-12
-    X = np.full((m, 3), np.nan)
-    X[ok] = Xh[ok, :3] / w[ok, None]
-    return X, ok
-
-
-# ---------------------------------------------------------------------- #
-# Levenberg-Marquardt
-# ---------------------------------------------------------------------- #
-def _eval(
-    P: FloatArray,
-    X: FloatArray,
-    obs: FloatArray,
-    sig: FloatArray,
-    need_jac: bool,
-) -> Tuple[FloatArray, FloatArray, Optional[FloatArray], FloatArray]:
-    """Residual đã whiten r (M,V,2), cost (M,), Jacobian (M,V,2,3), depth (M,V)."""
-    m = X.shape[0]
-    Xh = np.concatenate([X, np.ones((m, 1))], axis=1)
-    pr = np.einsum("vij,mj->mvi", P, Xh)
-    w = pr[..., 2]
-    w_safe = np.where(np.abs(w) < 1e-9, 1e-9, w)
-    uv = pr[..., :2] / w_safe[..., None]
-    r = (obs - uv) / sig
-    cost = np.sum(r * r, axis=(1, 2))
-    jac = None
-    if need_jac:
-        # d(uv)/dX = (P[:2,:3] - uv * P[2,:3]) / w
-        jac = (
-            P[None, :, :2, :3] - uv[..., None] * P[None, :, None, 2, :3]
-        ) / w_safe[..., None, None]
-        jac = jac / sig[..., None]
-    return r, cost, jac, w
-
-
-def _refine_lm(
-    P: FloatArray,
-    obs: FloatArray,
-    sig: FloatArray,
-    X0: FloatArray,
-    max_iters: int,
-    lam0: float,
-    tol: float,
-) -> Tuple[FloatArray, BoolArray]:
-    """LM vector hóa theo điểm. Trả về X đã tinh chỉnh và cờ hội tụ."""
-    X = X0.copy()
-    m = X.shape[0]
-    lam = np.full(m, lam0)
-    _, cost, _, _ = _eval(P, X, obs, sig, need_jac=False)
-    converged = np.zeros(m, dtype=bool)
-    eye = np.eye(3)
-
-    for _ in range(max_iters):
-        act = ~converged
-        if not act.any():
-            break
-        r, cost_cur, J, _ = _eval(P, X, obs, sig, need_jac=True)
-        assert J is not None
-        JtJ = np.einsum("mvki,mvkj->mij", J, J)
-        g = np.einsum("mvki,mvk->mi", J, r)
-        diag = np.einsum("mii->mi", JtJ)
-        Aug = JtJ + lam[:, None, None] * (diag[:, :, None] * eye) + 1e-12 * eye
-        try:
-            delta = np.linalg.solve(Aug, g[..., None])[..., 0]
-        except np.linalg.LinAlgError:
-            delta = np.zeros_like(g)
-        X_new = X + delta
-        _, cost_new, _, _ = _eval(P, X_new, obs, sig, need_jac=False)
-        accept = act & np.isfinite(cost_new) & (cost_new < cost_cur)
-        X[accept] = X_new[accept]
-        cost = np.where(accept, cost_new, cost_cur)
-        lam = np.where(accept, np.maximum(lam / 10.0, 1e-9), np.minimum(lam * 10.0, 1e8))
-        small = np.max(np.abs(delta), axis=1) < tol
-        converged |= small
-        # Điểm bị từ chối liên tục với lam lớn cũng coi như đã dừng
-        converged |= (~accept) & (lam >= 1e8)
-    return X, converged
-
-
-# ---------------------------------------------------------------------- #
-# API chính
-# ---------------------------------------------------------------------- #
-def triangulate_points_dlt(
-    projections: Sequence[ArrayLike],
-    points_2d: ArrayLike,
-    sigmas: Optional[ArrayLike] = None,
-    config: Optional[TriangulationConfig] = None,
-) -> TriangulationResult:
-    """Tam giác hóa N điểm từ V view (thường V=2: real + gương).
-
-    Args:
-        projections: V ma trận chiếu 3x4 (pixel, đã gỡ méo).
-        points_2d: (N, V, 2) tọa độ pixel đã gỡ méo; NaN = thiếu.
-        sigmas: (N, V, 2) = (sigma_u, sigma_v) pixel; None -> 1 px.
-        config: siêu tham số LM.
-
-    Returns:
-        TriangulationResult. Điểm có NaN ở bất kỳ view nào (hoặc thiếu số
-        view tối thiểu) cho X = NaN, valid = False.
-    """
-    cfg = config or TriangulationConfig()
-    P = np.stack([np.asarray(p, dtype=np.float64) for p in projections])
-    v = P.shape[0]
-    if v < 2:
-        raise ValueError("Cần tối thiểu 2 view.")
-    pts = np.asarray(points_2d, dtype=np.float64)
-    if pts.ndim != 3 or pts.shape[1] != v or pts.shape[2] != 2:
-        raise ValueError(f"points_2d phải có shape (N, {v}, 2), nhận {pts.shape}.")
-    n = pts.shape[0]
-    sig = (
-        np.ones((n, v, 2))
-        if sigmas is None
-        else np.asarray(sigmas, dtype=np.float64)
+    cam_cfg = load_yaml(args.config_camera)
+    mir_cfg = load_yaml(args.config_mirror)
+    system = MirrorCameraSystem.from_config(
+        cam_cfg, mir_cfg, target_image_size=IMAGE_SIZE
     )
-    if sig.shape != (n, v, 2):
-        raise ValueError(f"sigmas phải có shape {(n, v, 2)}, nhận {sig.shape}.")
+    LOG.info("%r", system)
 
-    use = (
-        np.isfinite(pts).all(axis=(1, 2))
-        & np.isfinite(sig).all(axis=(1, 2))
-        & (sig > 0).all(axis=(1, 2))
+    tri_cfg = TriangulationConfig.from_dict(mir_cfg.get("triangulation"))
+    run_cfg = mir_cfg.get("reconstruction", {}) or {}
+    min_conf = (args.min_confidence if args.min_confidence is not None
+                else float(run_cfg.get("min_confidence", 0.2)))
+    max_reproj = (args.max_reproj_px if args.max_reproj_px is not None
+                  else float(run_cfg.get("max_reproj_px", 20.0)))
+    max_gap_s = (args.max_gap_s if args.max_gap_s is not None
+                 else float(run_cfg.get("max_gap_s", 0.2)))
+    switch_penalty = (args.switch_penalty if args.switch_penalty is not None
+                      else float(run_cfg.get("switch_penalty_px", 4.0)))
+    min_joints = int(run_cfg.get("min_valid_joints", 8))
+    invalid_penalty = float(run_cfg.get("invalid_penalty_px", 15.0))
+    require_front = bool(run_cfg.get("require_front_of_mirror", True))
+    lr_pairs = [tuple(p) for p in run_cfg.get("lr_pairs", DEFAULT_LR_PAIRS)]
+    perm = lr_permutation(lr_pairs)
+
+    setup = mir_cfg.get("setup", {}) or {}
+    floor_y = run_cfg.get("floor_y_m", setup.get("camera_height"))
+    floor_tol = float(run_cfg.get("floor_tol_m", 0.05))
+    floor_policy = str(run_cfg.get("floor_policy", "warn"))
+    if floor_policy not in ("warn", "drop", "clamp"):
+        raise ValueError("floor_policy phải là warn | drop | clamp.")
+    walkway_expected = setup.get("walkway_to_mirror")
+
+    data = np.load(args.input_npz, allow_pickle=False)
+    real = np.asarray(data["real_kpts"], dtype=np.float64)
+    fps = float(data["fps"])
+
+    key = args.mirror_key
+    if key == "auto":
+        key = "raw" if "mirror_kpts_raw" in data.files else "mirror_kpts"
+    mirror_name = "mirror_kpts_raw" if key == "raw" else "mirror_kpts"
+    if mirror_name not in data.files:
+        raise KeyError(f"Không có khóa '{mirror_name}' trong {args.input_npz} "
+                       f"(có: {data.files}).")
+    mirror = np.asarray(data[mirror_name], dtype=np.float64)
+    if mirror_name == "mirror_kpts":
+        LOG.warning("Dùng 'mirror_kpts' (không phải raw): có thể đã bị lật tĩnh. "
+                    "Chế độ dual vẫn chọn đúng theo khung nhưng nên dùng raw.")
+    if real.shape != mirror.shape or real.ndim != 3 or real.shape[1:] != (N_JOINTS, 3):
+        raise ValueError(f"Shape không hợp lệ: real {real.shape}, mirror "
+                         f"{mirror.shape}; cần (T, {N_JOINTS}, 3).")
+    t_len = real.shape[0]
+    zeros = np.zeros((t_len, N_JOINTS), bool)
+    real_mask = np.asarray(data["real_mask"], bool) if "real_mask" in data.files else zeros
+    mirror_mask = (np.asarray(data["mirror_mask"], bool)
+                   if "mirror_mask" in data.files else zeros)
+
+    und_real = system.undistort_points(real[..., :2])
+    common = dict(
+        system=system, tri_cfg=tri_cfg, real=real, real_mask=real_mask,
+        und_real=und_real, min_conf=min_conf, max_reproj=max_reproj,
+        require_front=require_front,
     )
-    X_out = np.full((n, 3), np.nan)
-    resid = np.full((n, v, 2), np.nan)
-    cost_out = np.full(n, np.nan)
-    conv = np.zeros(n, dtype=bool)
-    front = np.zeros(n, dtype=bool)
-    valid = np.zeros(n, dtype=bool)
+    LOG.info("Tam giác hóa %d điểm x 2 giả thuyết (T=%d, J=%d)...",
+             t_len * N_JOINTS, t_len, N_JOINTS)
+    hyp_a = run_hypothesis(mirror=mirror, mirror_mask=mirror_mask, **common)
+    hyp_b = run_hypothesis(mirror=mirror[:, perm], mirror_mask=mirror_mask[:, perm],
+                           **common)
 
-    if use.sum() >= 3:
-        idx = np.flatnonzero(use)
-        x = pts[idx]
-        s = sig[idx]
+    cost_a = frame_costs(hyp_a["reproj"], hyp_a["keep"], min_joints, invalid_penalty)
+    cost_b = frame_costs(hyp_b["reproj"], hyp_b["keep"], min_joints, invalid_penalty)
+    costs = np.stack([cost_a, cost_b], axis=1)
 
-        # --- Bước 1: Hartley-normalized DLT ---
-        T = np.stack([hartley_normalization(x[:, i, :]) for i in range(v)])
-        P_n = np.einsum("vij,vjk->vik", T, P)
-        x_n = np.empty_like(x)
-        sig_n = np.empty_like(s)
-        for i in range(v):
-            scale = T[i, 0, 0]
-            x_n[:, i, :] = (x[:, i, :] - (-T[i, :2, 2] / scale)) * scale
-            sig_n[:, i, :] = s[:, i, :] * scale
-        X0, ok = _dlt_linear(P_n, x_n, sig_n)
+    if args.hypothesis == "raw":
+        swap = np.zeros(t_len, bool)
+    elif args.hypothesis == "swap":
+        swap = np.ones(t_len, bool)
+    else:
+        swap = viterbi_two_state(costs, switch_penalty)
+    n_switch = int(np.abs(np.diff(swap.astype(int))).sum())
+    chosen_cost = np.where(swap, cost_b, cost_a)
+    LOG.info("Chi phí TB/khung (px): A(raw) %.2f | B(hoán đổi) %.2f | đã chọn %.2f",
+             cost_a.mean(), cost_b.mean(), chosen_cost.mean())
+    LOG.info("Hoán đổi trái-phải ở %.1f%% khung, %d lần đổi giả thuyết.",
+             100.0 * swap.mean(), n_switch)
 
-        # --- Bước 2: LM tối thiểu sai số tái chiếu có trọng số ---
-        if cfg.refine:
-            good = np.flatnonzero(ok)
-            X_ref = X0.copy()
-            c_ref = np.zeros(idx.size, dtype=bool)
-            if good.size:
-                Xg, cg = _refine_lm(
-                    P, x[good], s[good], X0[good],
-                    cfg.max_iters, cfg.lm_lambda0, cfg.step_tol,
-                )
-                X_ref[good] = Xg
-                c_ref[good] = cg
-        else:
-            X_ref, c_ref = X0, ok.copy()
+    sw3 = swap[:, None, None]
+    pose = np.where(sw3, hyp_b["pose"], hyp_a["pose"])
+    reproj = np.where(sw3, hyp_b["reproj"], hyp_a["reproj"])
+    keep = np.where(swap[:, None], hyp_b["keep"], hyp_a["keep"])
+    mirror_corr = np.where(sw3, mirror[:, perm], mirror)
+    mirror_mask_corr = np.where(swap[:, None], mirror_mask[:, perm], mirror_mask)
 
-        r_w, cost, _, depth = _eval(
-            P, np.nan_to_num(X_ref, nan=0.0), x, s, need_jac=False
-        )
-        r_px = r_w * s  # đổi về pixel
-        good_pt = ok & np.isfinite(cost)
-        X_ref[~good_pt] = np.nan
-        X_out[idx] = X_ref
-        resid[idx] = np.where(good_pt[:, None, None], r_px, np.nan)
-        cost_out[idx] = np.where(good_pt, cost, np.nan)
-        conv[idx] = c_ref & good_pt
-        front[idx] = (depth > 0).all(axis=1) & good_pt
-        valid[idx] = good_pt
+    n_below_floor = 0
+    if floor_y is not None:
+        with np.errstate(invalid="ignore"):
+            below = pose[..., 1] > float(floor_y) + floor_tol
+        n_below_floor = int(below.sum())
+        if n_below_floor:
+            LOG.warning("%d điểm xuyên sàn (Y > %.3f + %.2f m); policy=%s.",
+                        n_below_floor, float(floor_y), floor_tol, floor_policy)
+            if floor_policy == "drop":
+                pose[below] = np.nan
+                reproj[below] = np.nan
+            elif floor_policy == "clamp":
+                with np.errstate(invalid="ignore"):
+                    over = pose[..., 1] > float(floor_y)
+                pose[..., 1] = np.where(over, float(floor_y), pose[..., 1])
 
-    reproj = np.linalg.norm(resid, axis=2)
-    return TriangulationResult(
-        points_3d=X_out,
-        residuals=resid,
+    pose, filled = fill_short_gaps(pose, int(round(max_gap_s * fps)))
+    valid_final = np.isfinite(pose).all(axis=2)
+
+    summary = build_summary(reproj, keep, filled, fps)
+    summary.update({
+        "hypothesis_mode": args.hypothesis,
+        "mirror_key": mirror_name,
+        "swap_ratio": float(swap.mean()),
+        "n_switches": n_switch,
+        "mean_frame_cost_A_px": float(cost_a.mean()),
+        "mean_frame_cost_B_px": float(cost_b.mean()),
+        "mean_frame_cost_chosen_px": float(chosen_cost.mean()),
+        "n_below_floor": n_below_floor,
+        "floor_y_m": None if floor_y is None else float(floor_y),
+    })
+    finite_pts = pose[valid_final]
+    if finite_pts.size:
+        dist_mirror = finite_pts @ system.normal + system.d
+        summary["mean_dist_to_mirror_m"] = float(dist_mirror.mean())
+        summary["frac_behind_mirror"] = float((dist_mirror <= 0).mean())
+        LOG.info("Khoảng cách tới gương: TB %.3f m (frac sau gương %.1f%%)",
+                 summary["mean_dist_to_mirror_m"],
+                 100.0 * summary["frac_behind_mirror"])
+        if walkway_expected is not None and (
+            abs(summary["mean_dist_to_mirror_m"] - float(walkway_expected)) > 0.2
+        ):
+            LOG.warning("Khoảng cách TB tới gương %.2f m lệch walkway_to_mirror="
+                        "%.2f m -> kiểm tra n, d (chạy 03a_diagnose_mirror.py).",
+                        summary["mean_dist_to_mirror_m"], float(walkway_expected))
+    LOG.info("Reproj TB: real %.2f px | gương %.2f px | valid %.1f%%",
+             summary["mean_reproj_real_all_px"],
+             summary["mean_reproj_mirror_all_px"], 100.0 * valid_final.mean())
+    if summary["mean_reproj_real_all_px"] > 4.0:
+        LOG.warning("Reproj vẫn cao (>4 px): ghép cặp còn sai ở các nhóm khớp "
+                    "riêng lẻ, hoặc K/n/d chưa đúng. Chạy 03a_diagnose_mirror.py.")
+
+    stem = args.input_npz.stem
+    video_name = stem[: -len("_filtered")] if stem.endswith("_filtered") else stem
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = args.output_dir / f"{video_name}_3d.npz"
+    summary_json = json.dumps(summary, ensure_ascii=False)
+    np.savez_compressed(
+        out_path,
+        pose_3d=pose,
         reproj_error=reproj,
-        cost=cost_out,
-        converged=conv,
-        in_front=front,
-        valid=valid,
+        summary=np.array(summary_json),
+        valid_mask=valid_final,
+        gap_filled_mask=filled,
+        mirror_swap=swap,
+        mirror_kpts_corrected=mirror_corr,
+        mirror_mask_corrected=mirror_mask_corr,
+        frame_cost=costs,
+        fps=np.float64(fps),
+        K=system.K,
+        mirror_normal=system.normal,
+        mirror_d=np.float64(system.d),
     )
+    with open(out_path.with_suffix(".summary.json"), "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(summary, ensure_ascii=False, indent=2))
+    LOG.info("Đã lưu: %s", out_path)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
