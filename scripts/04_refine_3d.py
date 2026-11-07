@@ -317,16 +317,17 @@ import yaml
 
 
 def calculate_anatomical_height(lengths_dict: Dict[str, float]) -> float:
-    """Tính tổng chiều cao giải phẫu từ chuỗi xương (shank + thigh + torso + head)."""
+    """Tính tổng chiều cao giải phẫu chuẩn: chân + đùi + thân + cổ/đầu + gót."""
     shank = np.nanmean([lengths_dict.get("shank_L", np.nan), lengths_dict.get("shank_R", np.nan)])
     thigh = np.nanmean([lengths_dict.get("thigh_L", np.nan), lengths_dict.get("thigh_R", np.nan)])
     torso = np.nanmean([lengths_dict.get("torso_L", np.nan), lengths_dict.get("torso_R", np.nan)])
     
-    # Ước lượng đầu cổ từ tai-mũi + bù đỉnh đầu và mắt cá xuống sàn
-    head = np.nanmean([lengths_dict.get("nose_ear_L", 0.15), lengths_dict.get("nose_ear_R", 0.15)]) + 0.10
-    ankle_to_floor = np.nanmean([lengths_dict.get("ankle_heel_L", 0.07), lengths_dict.get("ankle_heel_R", 0.07)])
+    # Cổ + đầu chuẩn nhân trắc học (từ vai lên đỉnh sọ): ~28 cm
+    # Mắt cá chân xuống mặt sàn (gót chân + đế dép): ~7 cm
+    head_and_neck = 0.28
+    ankle_to_floor = 0.07
     
-    return float(shank + thigh + torso + head + ankle_to_floor)
+    return float(shank + thigh + torso + head_and_neck + ankle_to_floor)
 
 
 def main():
