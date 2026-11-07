@@ -1,11 +1,12 @@
 mirror:
-  image_side: right          # left | right: ảnh trong gương nằm bên nào của người thật
-  # Không cần normal / d nữa; nếu vẫn ghi normal/d thì chúng được ưu tiên,
-  # trừ khi đặt use_setup: true để ép dùng số đo hiện trường.
+  image_side: right
+  normal: [-0.8588, 0.0634, -0.5084]
+  d: 4.271
+  vertical_down: [0.0364, 0.9974, 0.0628]
 
 setup:
-  camera_to_mirror: 3.49       # AB, đo dọc trục quang học (m)
-  angle_to_mirror_deg: 26.6    # góc giữa trục quang học và MẶT gương
+  camera_to_mirror: 3.49
+  angle_to_mirror_deg: 26.6
   camera_height: 1.39
   walkway_to_mirror: 0.76
   walkway_length: 6.00
