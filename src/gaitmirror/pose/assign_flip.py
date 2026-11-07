@@ -3,6 +3,13 @@ Module phân định Người thật - Gương và xử lý đảo tính đối 
 Hiện thực hóa theo nguyên lý hình học từ bài báo:
 Ajisafe et al., "Mirror-Aware Neural Humans", 3DV 2024.
 Tối ưu hóa cho phân tích dáng đi (Gait Analysis / LLD).
+
+Kiến trúc ranh giới rõ ràng:
+  - Tầng 2D (module này): Lưu trữ trung thực 100% tọa độ raw detection từ ViTPose.
+    KHÔNG thực hiện flip_wholebody() tại đây.
+  - Tầng 3D (mirror_optimization.py): Thực hiện correct_virt() so sánh per-frame
+    giữa hướng detection 2D và hướng bộ xương 3D chiếu ngược, kích hoạt hoán đổi
+    đối xứng chỉ khi cần thiết.
 """
 
 from dataclasses import dataclass, field
@@ -17,10 +24,14 @@ from gaitmirror.pose.keypoint_mapping import (
 
 @dataclass
 class AssociatedFrame:
-    """Kết quả phân định Thật - Gương kèm toàn bộ cờ kiểm soát chất lượng (QC)."""
+    """Kết quả phân định Thật - Gương kèm toàn bộ cờ kiểm soát chất lượng (QC).
+
+    Lưu ý kiến trúc: mirror_kpts_raw chứa tọa độ RAW detection từ ảnh gương,
+    chưa qua bất kỳ hoán đổi Trái/Phải nào. Trường mirror_kpts được giữ lại
+    để tương thích ngược nhưng BÁO KHÔNG NÊN dùng ở tầng 3D (dùng raw thay thế).
+    """
     real_kpts: Optional[np.ndarray] = None             # (133, 3) người thật
-    mirror_kpts: Optional[np.ndarray] = None           # (133, 3) bóng gương (đã swap L/R)
-    mirror_kpts_raw: Optional[np.ndarray] = None       # (133, 3) bóng gương gốc
+    mirror_kpts_raw: Optional[np.ndarray] = None       # (133, 3) bóng gương RAW (không flip)
     real_bbox: Optional[np.ndarray] = None             # [x1, y1, x2, y2]
     mirror_bbox: Optional[np.ndarray] = None           # [x1, y1, x2, y2]
     boxes_overlap: bool = False                        # True nếu hai bounding box đè lên nhau
@@ -170,18 +181,17 @@ def clean_and_associate(
         real_kpts, mirror_kpts_raw = kpts_b, kpts_a
         real_box, mirror_box = box_b, box_a
 
-    # Đảo nhãn Trái <-> Phải cho bóng trong gương
-    mirror_kpts_swapped = flip_wholebody(mirror_kpts_raw)
-
     # Kiểm tra đè hộp bounding box
     iou = compute_bbox_iou(real_box, mirror_box)
     boxes_overlap = iou > iou_thresh
     if boxes_overlap:
         flags.append("HOP_CHONG")
 
+    # KIẾN TRÚC: Lưu nguyên trạng mirror_kpts_raw (133, 3) vào AssociatedFrame.
+    # KHÔNG thực hiện flip_wholebody() tại đây — tuân thủ ranh giới tầng 2D/3D
+    # theo Ajisafe et al. (3DV 2024). Tầng 3D sẽ tự gọi correct_virt() per-frame.
     frame_result = AssociatedFrame(
         real_kpts=real_kpts,
-        mirror_kpts=mirror_kpts_swapped,
         mirror_kpts_raw=mirror_kpts_raw,
         real_bbox=real_box,
         mirror_bbox=mirror_box,

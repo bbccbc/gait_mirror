@@ -1,5 +1,5 @@
 mirror:
-  image_side: left          # left | right: ảnh trong gương nằm bên nào của người thật
+  image_side: right          # left | right: ảnh trong gương nằm bên nào của người thật
   # Không cần normal / d nữa; nếu vẫn ghi normal/d thì chúng được ưu tiên,
   # trừ khi đặt use_setup: true để ép dùng số đo hiện trường.
 

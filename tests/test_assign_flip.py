@@ -1,6 +1,11 @@
 """
 Unit tests cho module assign_flip.py
 Bao phủ các ca biên: NaN, người thứ ba, thiếu người, hòa thân, và tính lũy hoàn của flip.
+
+KIẾN TRÚC QUAN TRỌNG (Ajisafe et al., 3DV 2024):
+  - clean_and_associate() KHÔNG được gọi flip_wholebody() — tầng 2D lưu raw.
+  - AssociatedFrame.mirror_kpts_raw phải == raw detection (KHÔNG hoán đổi).
+  - Tầng 3D (mirror_optimization.correct_virt) tự quyết định flip per-frame.
 """
 
 import numpy as np
@@ -128,3 +133,103 @@ def test_flip_wholebody_involution():
 
     # Đảm bảo lật 2 lần khôi phục 100% dữ liệu ban đầu
     assert np.allclose(kpts_orig, kpts_flipped_twice)
+
+
+# -------------------------------------------------------------------------
+# Test 6: KIẾN TRÚC — mirror_kpts_raw phải bảo toàn nguyên vẹn tọa độ RAW
+# Xác nhận clean_and_associate() KHÔNG gọi flip_wholebody() nội bộ.
+# -------------------------------------------------------------------------
+def test_mirror_kpts_raw_is_unmodified():
+    """
+    Đây là test kiến trúc cốt lõi theo Ajisafe et al. (3DV 2024):
+      - Tầng 2D KHÔNG được flip L/R lên raw detection.
+      - mirror_kpts_raw phải == bản sao nguyên trạng của kpts input (bóng gương).
+      - Việc so sánh hướng và quyết định flip thuộc trách nhiệm tầng 3D (correct_virt).
+    """
+    # Tạo pose thật (thân dài hơn) và pose bóng gương (thân ngắn hơn)
+    kpts_real_input = _create_mock_kpts(torso_length=160.0)
+    kpts_mirror_input = _create_mock_kpts(torso_length=100.0)
+
+    # Phân biệt hai pose bằng giá trị ngẫu nhiên riêng biệt
+    # (để không nhầm lẫn khi so sánh)
+    rng = np.random.default_rng(42)
+    kpts_real_input[:, 0] += rng.uniform(0, 5, 133).astype(np.float32)
+    kpts_mirror_input[:, 0] += rng.uniform(100, 105, 133).astype(np.float32)
+
+    box_real = np.array([100.0, 100.0, 300.0, 500.0])
+    box_mirror = np.array([400.0, 100.0, 600.0, 460.0])
+
+    res, flags = clean_and_associate(
+        kpts_a=kpts_real_input,
+        kpts_b=kpts_mirror_input,
+        box_a=box_real,
+        box_b=box_mirror,
+        iou_thresh=0.05,
+        ratio_thresh=0.95,
+    )
+
+    assert res is not None, "Phân định phải thành công với 2 pose hợp lệ"
+    assert res.mirror_kpts_raw is not None, "mirror_kpts_raw không được None"
+
+    # KHẲNG ĐỊNH TRUNG TÂM: mirror_kpts_raw phải == kpts_mirror_input (bóng gương)
+    # và KHÔNG phải kpts_real_input (người thật)
+    # Vì kpts_mirror_input có torso_length nhỏ hơn nên được phân định là gương.
+    np.testing.assert_array_equal(
+        res.mirror_kpts_raw,
+        kpts_mirror_input,
+        err_msg=(
+            "mirror_kpts_raw phải bảo toàn nguyên trạng raw detection của bóng gương. "
+            "clean_and_associate() không được gọi flip_wholebody() nội bộ!"
+        ),
+    )
+
+    # Đảm bảo real_kpts cũng đúng (không nhầm thật/gương)
+    np.testing.assert_array_equal(
+        res.real_kpts,
+        kpts_real_input,
+        err_msg="real_kpts phải là pose có thân dài hơn (người thật).",
+    )
+
+
+# -------------------------------------------------------------------------
+# Test 7: mirror_kpts_raw khác mirror_kpts đã flip (dùng flip_wholebody thủ công)
+# Đảm bảo tầng 3D nhận được raw và CÓ THỂ tự quyết định flip.
+# -------------------------------------------------------------------------
+def test_raw_vs_flipped_are_different():
+    """
+    Kiểm tra rằng mirror_kpts_raw (raw detection) khác với kết quả
+    sau khi áp dụng flip_wholebody() — xác nhận tầng 3D có dữ liệu
+    đúng để thực hiện correct_virt().
+    """
+    kpts_real = _create_mock_kpts(torso_length=150.0)
+    kpts_mirror_raw = _create_mock_kpts(torso_length=90.0)
+    # Làm cho kpts_mirror_raw có L_KNEE và R_KNEE khác giá trị rõ ràng
+    kpts_mirror_raw[L_KNEE, 0] = 50.0
+    kpts_mirror_raw[R_KNEE, 0] = 70.0
+
+    box_real = np.array([100.0, 100.0, 300.0, 500.0])
+    box_mirror = np.array([400.0, 100.0, 600.0, 460.0])
+
+    res, _ = clean_and_associate(
+        kpts_a=kpts_real,
+        kpts_b=kpts_mirror_raw,
+        box_a=box_real,
+        box_b=box_mirror,
+        iou_thresh=0.05,
+    )
+
+    assert res is not None
+    raw = res.mirror_kpts_raw
+
+    # Thực hiện flip thủ công để có phiên bản đã hoán đổi
+    flipped = flip_wholebody(raw)
+
+    # raw và flipped phải KHÁC nhau (vì L_KNEE != R_KNEE)
+    assert not np.allclose(raw[L_KNEE], raw[R_KNEE]), \
+        "Setup test sai: L_KNEE và R_KNEE phải khác nhau để test có ý nghĩa"
+    assert not np.allclose(raw, flipped), \
+        "raw và flipped phải khác nhau (flip_wholebody chưa được áp dụng vào raw)"
+
+    # Nhưng nếu flip 2 lần sẽ ra lại raw
+    assert np.allclose(raw, flip_wholebody(flipped)), \
+        "Áp dụng flip 2 lần phải trả về dữ liệu gốc"

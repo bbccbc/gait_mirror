@@ -5,6 +5,11 @@ Video (.mp4) -> VideoReader -> YOLO26n -> ViTPose WholeBody (133 kpts)
              -> drop_bystanders -> clean_and_associate
              -> cắt lát 23 điểm giải phẫu (COCO-17 + 6 foot) -> Storage (.npz)
 
+Kiến trúc ranh giới (Ajisafe et al., 3DV 2024):
+  - clean_and_associate() KHÔNG thực hiện flip_wholebody() — bảo toàn 100% raw.
+  - Lưu mirror_kpts_raw (tọa độ RAW detection, không hoán đổi L/R).
+  - Tầng 3D sẽ gọi correct_virt() per-frame để so sánh hướng & quyết định flip.
+
 Ghi chú: ViTPose vẫn suy luận đủ 133 điểm để các module phía sau (đặc biệt là
 logic đảo chirality trái/phải) hoạt động ổn định. Việc thu hẹp xuống 23 điểm
 chỉ diễn ra ở bước gán dữ liệu vào mảng lưu trữ.
@@ -151,7 +156,7 @@ def run_pipeline(
 
         # Cấp phát sẵn mảng cố định (T, 23, 3) khởi tạo bằng NaN
         real_kpts_all = np.full((T, NUM_KPTS_OUT, 3), np.nan, dtype=np.float32)
-        mirror_kpts_all = np.full((T, NUM_KPTS_OUT, 3), np.nan, dtype=np.float32)
+        mirror_kpts_raw_all = np.full((T, NUM_KPTS_OUT, 3), np.nan, dtype=np.float32)
         real_bboxes_all = np.full((T, 4), np.nan, dtype=np.float32)
         mirror_bboxes_all = np.full((T, 4), np.nan, dtype=np.float32)
         torso_ratios_all = np.full((T,), np.nan, dtype=np.float32)
@@ -182,8 +187,9 @@ def run_pipeline(
                 flags_all.append(drop_flags + ["THIEU_NGUOI"])
                 continue
 
-            # 5. Phân định Thật - Gương, đảo chirality và kiểm tra che khuất
-            #    (vẫn làm việc trên 133 điểm)
+            # 5. Phân định Thật - Gương (theo chiều dài thân) và kiểm tra che khuất.
+            #    KHÔNG flip: mirror_kpts_raw được lưu nguyên trạng (vẫn làm việc trên 133 điểm).
+            #    Tầng 3D sẽ gọi correct_virt() per-frame để so sánh hướng & quyết định flip.
             frame_res, assoc_flags = clean_and_associate(
                 selected_kpts[0],
                 selected_kpts[1],
@@ -198,8 +204,9 @@ def run_pipeline(
 
             if frame_res is not None:
                 # 6. Cắt lát xuống 23 điểm giải phẫu NGAY TẠI bước gán dữ liệu
+                # Lưu mirror_kpts_raw (tọa độ RAW, không flip) — tầng 3D tự quyết định
                 real_kpts_all[frame_idx] = _slice_kpts(frame_res.real_kpts)
-                mirror_kpts_all[frame_idx] = _slice_kpts(frame_res.mirror_kpts)
+                mirror_kpts_raw_all[frame_idx] = _slice_kpts(frame_res.mirror_kpts_raw)
                 real_bboxes_all[frame_idx] = frame_res.real_bbox
                 mirror_bboxes_all[frame_idx] = frame_res.mirror_bbox
                 torso_ratios_all[frame_idx] = frame_res.torso_ratio
@@ -225,7 +232,7 @@ def run_pipeline(
     save_assigned_2d(
         output_path=out_file,
         real_kpts=real_kpts_all,
-        mirror_kpts=mirror_kpts_all,
+        mirror_kpts_raw=mirror_kpts_raw_all,
         real_bboxes=real_bboxes_all,
         mirror_bboxes=mirror_bboxes_all,
         flags_per_frame=flags_all,
