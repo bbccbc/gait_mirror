@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """Chẩn đoán hình học gương từ dữ liệu 2D (không dùng n, d nhập tay).
 
-Ý tưởng:
-  1. Gương thẳng đứng => n = (sin phi, 0, -cos phi), chỉ còn 1 ẩn: phi.
-  2. Quét phi, tam giác hóa một tập điểm con, chọn phi có sai số tái chiếu
-     (median, px) nhỏ nhất. Sai số tái chiếu KHÔNG phụ thuộc d (d chỉ đổi tỉ lệ
-     3D) nên d lấy từ ràng buộc ngoài: bàn chân ở Y = camera_height.
-  3. In so sánh với cấu hình hiện tại và đoạn YAML đề xuất.
+Hai kiểm tra độc lập với d:
 
-Ví dụ::
+1. Đồng quy (epipole): với gương phẳng, đường thẳng nối điểm thật và điểm ảnh
+   gương của cùng một khớp đều đi qua một điểm e = K n. Nếu các đường không
+   đồng quy => ghép cặp real/mirror sai (lật trái-phải, nhầm người...). Script
+   thử cả hai trường hợp: giữ nguyên và hoán đổi trái-phải của mirror_kpts.
+2. Quét hướng gương: n = (sin phi, 0, -cos phi), chọn phi có sai số tái chiếu
+   nhỏ nhất; so với n suy từ epipole (cho phép n_y != 0 khi camera chúi).
 
-    python scripts/03a_diagnose_mirror.py \\
-        --input_npz data/interim/assigned_2d/IMG_8380_filtered.npz \\
-        --config_camera configs/camera.yaml \\
-        --config_mirror configs/mirror.yaml
+d chỉ đổi tỉ lệ 3D nên không quan sát được từ sai số tái chiếu; lấy từ ràng
+buộc bàn chân ở Y = setup.camera_height.
 """
 
 from __future__ import annotations
@@ -22,7 +20,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import yaml
@@ -42,7 +40,17 @@ from gaitmirror.reconstruction.triangulate_dlt import (  # noqa: E402
 LOG = logging.getLogger("diagnose_mirror")
 FloatArray = NDArray[np.float64]
 FOOT_IDS = (17, 18, 19, 20, 21, 22)
-D0 = 1.0  # d tùy ý: chỉ đổi tỉ lệ, không đổi sai số tái chiếu
+# Cặp trái-phải theo quy ước 23 điểm: COCO-17 + [LBT, LST, LH, RBT, RST, RH]
+LR_PAIRS = [(1, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (13, 14),
+            (15, 16), (17, 20), (18, 21), (19, 22)]
+D0 = 1.0
+
+
+def lr_permutation(n_joints: int = 23) -> NDArray[np.int64]:
+    perm = np.arange(n_joints)
+    for a, b in LR_PAIRS:
+        perm[a], perm[b] = b, a
+    return perm
 
 
 def normal_from_phi(phi_deg: float) -> FloatArray:
@@ -50,26 +58,64 @@ def normal_from_phi(phi_deg: float) -> FloatArray:
     return np.array([np.sin(p), 0.0, -np.cos(p)])
 
 
-def phi_from_normal(n: FloatArray) -> float:
-    return float(np.degrees(np.arctan2(n[0], -n[2])))
+def fit_epipole(
+    pr: FloatArray, pm: FloatArray, center: FloatArray
+) -> Tuple[FloatArray, FloatArray]:
+    """Điểm đồng quy e (3,) và khoảng cách (px) từ e tới từng đường nối.
+
+    Lặp 4 lần, mỗi lần bỏ các đường có residual > 3 lần median (robust).
+    """
+    s = 1000.0
+    a = np.c_[(pr - center) / s, np.ones(len(pr))]
+    b = np.c_[(pm - center) / s, np.ones(len(pm))]
+    lines = np.cross(a, b)
+    norm = np.linalg.norm(lines[:, :2], axis=1)
+    keep = norm > 1e-9
+    lines = lines[keep] / norm[keep, None]
+    use = np.ones(len(lines), bool)
+    e = np.array([0.0, 0.0, 1.0])
+    for _ in range(4):
+        _, _, vt = np.linalg.svd(lines[use], full_matrices=False)
+        e = vt[-1]
+        res = np.abs(lines @ e) / max(abs(e[2]), 1e-12)
+        use = res <= max(3.0 * np.median(res), 1e-6)
+    # đổi về pixel
+    e_px = np.array([e[0] * s + center[0] * e[2], e[1] * s + center[1] * e[2], e[2]])
+    res_px = np.full(len(pr), np.nan)
+    res_px[keep] = np.abs(lines @ e) / max(abs(e[2]), 1e-12) * s
+    return e_px, res_px
+
+
+def prepare(
+    pts: FloatArray, conf: FloatArray, interp: FloatArray,
+    min_conf: float, n_points: int, seed: int,
+) -> Tuple[FloatArray, FloatArray, NDArray[np.int64]]:
+    good = (
+        np.isfinite(pts).all(axis=(2, 3))
+        & (np.nan_to_num(conf, nan=0.0) >= min_conf).all(axis=2)
+        & ~interp.any(axis=2)
+    )
+    tt, jj = np.nonzero(good)
+    if tt.size < 100:
+        raise SystemExit(f"Quá ít điểm hợp lệ ({tt.size}).")
+    rng = np.random.default_rng(seed)
+    sel = rng.choice(tt.size, size=min(n_points, tt.size), replace=False)
+    tt, jj = tt[sel], jj[sel]
+    return pts[tt, jj], conf[tt, jj], jj
 
 
 def evaluate(
-    K: FloatArray,
-    phi_deg: float,
-    pts: FloatArray,
-    sig: FloatArray,
+    K: FloatArray, n: FloatArray, pts: FloatArray, sig: FloatArray,
     cfg: TriangulationConfig,
 ) -> Tuple[float, float, FloatArray, FloatArray]:
-    """Trả về (median reproj px, valid_frac, X (N,3), valid (N,))."""
-    system = MirrorCameraSystem(K, normal_from_phi(phi_deg), D0)
+    system = MirrorCameraSystem(K, n, D0)
     res = triangulate_points_dlt(system.projection_matrices, pts, sig, cfg)
     ok = res.valid & res.in_front
     frac = float(ok.mean())
     if frac < 0.2:
         return 1e3, frac, res.points_3d, ok
-    err = res.reproj_error[ok].mean(axis=1)
-    return float(np.median(err)), frac, res.points_3d, ok
+    return float(np.median(res.reproj_error[ok].mean(axis=1))), frac, \
+        res.points_3d, ok
 
 
 def main() -> int:
@@ -84,10 +130,8 @@ def main() -> int:
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    with open(args.config_camera, "r", encoding="utf-8") as fh:
-        cam_cfg: Dict[str, Any] = yaml.safe_load(fh)
-    with open(args.config_mirror, "r", encoding="utf-8") as fh:
-        mir_cfg: Dict[str, Any] = yaml.safe_load(fh)
+    cam_cfg: Dict[str, Any] = yaml.safe_load(open(args.config_camera, encoding="utf-8"))
+    mir_cfg: Dict[str, Any] = yaml.safe_load(open(args.config_mirror, encoding="utf-8"))
     setup = mir_cfg.get("setup", {}) or {}
     cam_height = setup.get("camera_height")
     walkway = setup.get("walkway_to_mirror")
@@ -96,108 +140,107 @@ def main() -> int:
         cam_cfg, mir_cfg, target_image_size=(1920, 1080)
     )
     K = current.K
+    center = K[:2, 2].copy()
     tri_cfg = TriangulationConfig.from_dict(mir_cfg.get("triangulation"))
     tri_cfg.max_iters = 8
 
     data = np.load(args.input_npz, allow_pickle=False)
-    real, mirror = data["real_kpts"], data["mirror_kpts"]
+    mkey = "mirror_kpts_raw" if "mirror_kpts_raw" in data.files else "mirror_kpts"
+    real, mirror = data["real_kpts"], data[mkey]
     t_len, n_j, _ = real.shape
-    pts = np.stack([real[..., :2], mirror[..., :2]], axis=2)
-    conf = np.stack([real[..., 2], mirror[..., 2]], axis=2)
     interp = np.zeros((t_len, n_j, 2), bool)
     for i, key in enumerate(("real_mask", "mirror_mask")):
         if key in data.files:
             interp[..., i] = data[key]
-    pts = current.undistort_points(pts)
-    good = (
-        np.isfinite(pts).all(axis=(2, 3))
-        & (np.nan_to_num(conf, nan=0.0) >= args.min_confidence).all(axis=2)
-        & ~interp.any(axis=2)
-    )
-    tt, jj = np.nonzero(good)
-    if tt.size < 100:
-        raise SystemExit(f"Quá ít điểm hợp lệ ({tt.size}).")
-    rng = np.random.default_rng(args.seed)
-    sel = rng.choice(tt.size, size=min(args.n_points, tt.size), replace=False)
-    tt, jj = tt[sel], jj[sel]
-    p_sub, c_sub = pts[tt, jj], conf[tt, jj]
-    sig = build_sigmas(jj, c_sub, None, tri_cfg)
-    LOG.info("Dùng %d điểm để quét phi.", tt.size)
+    perm = lr_permutation(n_j)
 
-    # --- Quét phi ---
+    def build(swap: bool) -> Tuple[FloatArray, FloatArray, NDArray[np.int64]]:
+        m = mirror[:, perm] if swap else mirror
+        it = interp.copy()
+        if swap:
+            it[..., 1] = it[:, perm, 1]
+        p = np.stack([real[..., :2], m[..., :2]], axis=2)
+        c = np.stack([real[..., 2], m[..., 2]], axis=2)
+        return prepare(current.undistort_points(p), c, it,
+                       args.min_confidence, args.n_points, args.seed)
+
+    # ---- Kiểm tra 1: đồng quy, thử giữ nguyên / hoán đổi trái-phải ----
+    results = {}
+    for swap in (False, True):
+        p_sub, c_sub, jj = build(swap)
+        e, res = fit_epipole(p_sub[:, 0], p_sub[:, 1], center)
+        n_e = np.linalg.solve(K, e)
+        n_e /= np.linalg.norm(n_e)
+        if n_e[2] > 0:
+            n_e = -n_e
+        results[swap] = (float(np.nanmedian(res)), float(np.nanpercentile(res, 90)),
+                         n_e, p_sub, c_sub, jj)
+        LOG.info(
+            "Epipole [%s]: median %.1f px, p90 %.1f px | n=%s",
+            "hoán đổi trái-phải" if swap else "giữ nguyên",
+            results[False if not swap else True][0],
+            results[swap][1], np.round(n_e, 3).tolist(),
+        )
+    swap_best = results[True][0] < results[False][0]
+    med, p90, n_epi, p_sub, c_sub, jj = results[swap_best]
+    if swap_best and results[True][0] < 0.7 * results[False][0]:
+        LOG.warning(
+            "Hoán đổi trái-phải của mirror_kpts đồng quy tốt hơn hẳn: bước gán "
+            "real/mirror có vẻ lật SAI (chưa lật, hoặc lật hai lần)."
+        )
+    if med > 8.0:
+        LOG.warning(
+            "Các đường nối real-mirror KHÔNG đồng quy (median %.1f px): ghép cặp "
+            "điểm/nhầm người ở nhiều khung hình, hoặc K/méo sai. Hãy sửa dữ liệu "
+            "2D trước, thông số gương chưa phải vấn đề.", med,
+        )
+
+    # ---- Kiểm tra 2: quét phi + n từ epipole ----
+    sig = build_sigmas(jj, c_sub, None, tri_cfg)
     phis = np.arange(-85.0, 85.0 + 1e-9, args.phi_step)
-    costs = np.array([evaluate(K, p, p_sub, sig, tri_cfg)[0] for p in phis])
-    best = int(np.argmin(costs))
-    phi_best = float(phis[best])
+    costs = np.array([evaluate(K, normal_from_phi(p), p_sub, sig, tri_cfg)[0]
+                      for p in phis])
+    phi_best = float(phis[int(np.argmin(costs))])
     try:
         from scipy.optimize import minimize_scalar
 
-        r = minimize_scalar(
-            lambda p: evaluate(K, p, p_sub, sig, tri_cfg)[0],
-            bounds=(phi_best - 2.0, phi_best + 2.0),
-            method="bounded",
-        )
-        phi_best = float(r.x)
+        phi_best = float(minimize_scalar(
+            lambda p: evaluate(K, normal_from_phi(p), p_sub, sig, tri_cfg)[0],
+            bounds=(phi_best - 2.0, phi_best + 2.0), method="bounded").x)
     except ImportError:
         pass
-    cost_best, frac_best, X, ok = evaluate(K, phi_best, p_sub, sig, tri_cfg)
+    n_sweep = normal_from_phi(phi_best)
+    c_sweep = evaluate(K, n_sweep, p_sub, sig, tri_cfg)
+    c_epi = evaluate(K, n_epi, p_sub, sig, tri_cfg)
+    c_cfg = evaluate(K, current.normal, p_sub, sig, tri_cfg)
+    LOG.info("Reproj median: quét phi=%.1f deg -> %.2f px | n từ epipole -> %.2f px "
+             "| cấu hình hiện tại -> %.2f px", phi_best, c_sweep[0], c_epi[0], c_cfg[0])
+    n_best, c_best = (n_epi, c_epi) if c_epi[0] < c_sweep[0] else (n_sweep, c_sweep)
 
-    # Tối ưu cục bộ thứ hai ở phía đối diện dấu để cho thấy độ phân biệt
-    other = costs[np.sign(phis) != np.sign(phi_best)]
-    LOG.info(
-        "phi tốt nhất = %.2f deg: median reproj %.2f px (valid %.0f%%). "
-        "Tốt nhất phía dấu ngược lại: %.2f px.",
-        phi_best, cost_best, 100 * frac_best, float(other.min()),
-    )
-
-    # --- Hiện tại ---
-    phi_cfg = phi_from_normal(current.normal)
-    c_cfg = evaluate(K, phi_cfg, p_sub, sig, tri_cfg)
-    LOG.info(
-        "Cấu hình hiện tại: phi=%.2f deg: median reproj %.2f px (valid %.0f%%).",
-        phi_cfg, c_cfg[0], 100 * c_cfg[1],
-    )
-
-    # --- d từ chiều cao camera (sàn Y = camera_height) ---
-    n_best = normal_from_phi(phi_best)
+    # ---- d từ chiều cao camera ----
+    _, frac, X, ok = c_best
     foot = np.isin(jj, FOOT_IDS) & ok
-    d_est = None
+    d_est: Optional[float] = None
     if cam_height is not None and foot.sum() >= 20:
         y_med = float(np.median(X[foot, 1]))
         if y_med > 0:
             scale = float(cam_height) / y_med
             d_est = D0 * scale
-            X_s = X[ok] * scale
-            dist = X_s @ n_best + d_est
-            LOG.info(
-                "Tỉ lệ từ sàn: %.4f => d = %.4f m. Khoảng cách TB người-gương: "
-                "%.3f m (kỳ vọng walkway_to_mirror = %s).",
-                scale, d_est, float(dist.mean()), walkway,
-            )
+            dist = (X[ok] * scale) @ n_best + d_est
+            LOG.info("Tỉ lệ từ sàn %.4f => d = %.4f m | khoảng cách TB người-gương "
+                     "%.3f m (kỳ vọng %s)", scale, d_est, float(dist.mean()), walkway)
         else:
-            LOG.warning("Y bàn chân trung vị <= 0: camera nghiêng hoặc sai hình học.")
-    else:
-        LOG.warning("Không đủ điểm bàn chân hoặc thiếu setup.camera_height.")
+            LOG.warning("Y bàn chân trung vị <= 0: hình học vẫn chưa hợp lệ.")
+    if c_best[0] > 3.0:
+        LOG.warning("Reproj tối thiểu vẫn %.1f px: chưa tin được n, d bên dưới.",
+                    c_best[0])
 
-    if cost_best > 3.0:
-        LOG.warning(
-            "Sai số tái chiếu tối thiểu vẫn %.1f px: vấn đề có thể nằm ở gán "
-            "real/mirror, lật trái-phải của mirror_kpts, hoặc K/méo, không chỉ ở n.",
-            cost_best,
-        )
-
-    print("\n--- Đề xuất cho configs/mirror.yaml ---")
+    print("\n--- Đề xuất cho configs/mirror.yaml (chỉ dùng nếu reproj <~ 3 px) ---")
+    print(f"# hoán đổi trái-phải mirror_kpts: {'CÓ' if swap_best else 'không'}")
     print("mirror:")
-    print(f"  normal: [{n_best[0]:.4f}, 0.0, {n_best[2]:.4f}]")
+    print(f"  normal: [{n_best[0]:.4f}, {n_best[1]:.4f}, {n_best[2]:.4f}]")
     if d_est is not None:
         print(f"  d: {d_est:.4f}")
-    print("  # xóa image_side / use_setup khi dùng normal + d tường minh")
-    print(f"# angle_to_mirror_deg (góc trục-mặt gương) ≈ {90.0 - abs(phi_best):.1f}")
-    if d_est is not None:
-        print(
-            "# camera_to_mirror (dọc trục) ≈ "
-            f"{d_est / max(np.sin(np.deg2rad(90 - abs(phi_best))), 1e-6):.2f} m"
-        )
     return 0
 
 
