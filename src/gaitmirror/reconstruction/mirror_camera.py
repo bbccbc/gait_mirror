@@ -84,6 +84,49 @@ class MirrorCameraSystem:
     # Khởi tạo từ config
     # ------------------------------------------------------------------ #
     @staticmethod
+    def _rescale_K(
+        K: FloatArray,
+        calib_size: Sequence[int],
+        data_size: Sequence[int],
+        aspect_mode: str = "none",
+    ) -> FloatArray:
+        """Quy đổi K từ độ phân giải hiệu chuẩn sang độ phân giải dữ liệu.
+
+        aspect_mode:
+          * "none": chỉ cho phép khi hai độ phân giải cùng tỉ lệ khung hình
+            (scale đều); khác tỉ lệ -> ValueError để tránh sai K âm thầm.
+          * "crop": ảnh đích là vùng cắt giữa của ảnh gốc sau khi scale đều
+            theo cạnh "phủ kín" (cover): s = max(tw/cw, th/ch), cắt phần dư
+            ở giữa. Phù hợp ảnh 4:3 -> video 16:9 (cùng chiều ngang cảm biến).
+        Hệ số méo không đổi (định nghĩa trên tọa độ chuẩn hóa).
+        """
+        cw, ch = float(calib_size[0]), float(calib_size[1])
+        tw, th = float(data_size[0]), float(data_size[1])
+        K = np.asarray(K, dtype=np.float64).copy()
+        if cw == tw and ch == th:
+            return K
+        if aspect_mode == "crop":
+            s = max(tw / cw, th / ch)
+            ox = (cw * s - tw) / 2.0
+            oy = (ch * s - th) / 2.0
+            K[0, :] *= s
+            K[1, :] *= s
+            K[0, 2] -= ox
+            K[1, 2] -= oy
+            return K
+        if aspect_mode != "none":
+            raise ValueError(f"aspect_mode không hợp lệ: {aspect_mode!r}")
+        if abs(cw / ch - tw / th) > 1e-3:
+            raise ValueError(
+                f"Tỉ lệ khung hình khác nhau ({cw:.0f}x{ch:.0f} vs "
+                f"{tw:.0f}x{th:.0f}); đặt camera.aspect_mode: crop nếu video là "
+                "vùng cắt giữa của ảnh hiệu chuẩn."
+            )
+        K[0, :] *= tw / cw
+        K[1, :] *= th / ch
+        return K
+
+    @staticmethod
     def plane_from_setup(
         camera_to_mirror: float, angle_to_mirror_deg: float, image_side: str
     ) -> Tuple[FloatArray, float]:
@@ -158,12 +201,9 @@ class MirrorCameraSystem:
         calib_size = cam.get("calib_image_size", cam.get("image_size"))
         data_size = target_image_size or cam.get("image_size", calib_size)
         if calib_size is not None and data_size is not None:
-            sx = float(data_size[0]) / float(calib_size[0])
-            sy = float(data_size[1]) / float(calib_size[1])
-            if abs(sx - 1.0) > 1e-9 or abs(sy - 1.0) > 1e-9:
-                K = K.copy()
-                K[0, :] *= sx
-                K[1, :] *= sy
+            K = cls._rescale_K(
+                K, calib_size, data_size, str(cam.get("aspect_mode", "none"))
+            )
 
         mir = _section(mirror_cfg, "mirror")
         setup = mirror_cfg.get("setup", {}) or {}

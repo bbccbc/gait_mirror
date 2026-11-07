@@ -1,0 +1,14 @@
+# configs/camera.yaml
+# Hiệu chuẩn: 22 ảnh bàn cờ 9x6, ô 28 mm, ảnh 5712x4284 (RMS 0.924 px ở độ
+# phân giải gốc). Video đi bộ 1920x1080 được giả định là vùng cắt giữa 16:9 của
+# ảnh 4:3 (cùng chiều ngang cảm biến) -> aspect_mode: crop.
+camera:
+  K:
+    - [4260.873616495382, 0.0, 2820.039451506343]
+    - [0.0, 4267.494555649792, 2081.7154766735252]
+    - [0.0, 0.0, 1.0]
+  dist: [-0.014171527375705236, 0.023754001260006853,
+         -0.0005059224811482416, -0.0019882038947525234, 0.0]  # k1 k2 p1 p2 k3
+  calib_image_size: [5712, 4284]
+  image_size: [1920, 1080]
+  aspect_mode: crop
