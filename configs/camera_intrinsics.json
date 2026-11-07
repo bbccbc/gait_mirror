@@ -1,0 +1,92 @@
+{
+    "rms_error": 0.9236638285082603,
+    "image_width": 5712,
+    "image_height": 4284,
+    "fx": 4260.873616495382,
+    "fy": 4267.494555649792,
+    "cx": 2820.039451506343,
+    "cy": 2081.7154766735252,
+    "K": [
+        [
+            4260.873616495382,
+            0.0,
+            2820.039451506343
+        ],
+        [
+            0.0,
+            4267.494555649792,
+            2081.7154766735252
+        ],
+        [
+            0.0,
+            0.0,
+            1.0
+        ]
+    ],
+    "dist_coeff": [
+        -0.014171527375705236,
+        0.023754001260006853,
+        -0.0005059224811482416,
+        -0.0019882038947525234,
+        0.0
+    ],
+    "per_image_rms": [
+        0.3459864854812622,
+        1.604522943496704,
+        0.9637244939804077,
+        0.922505259513855,
+        1.1579731702804565,
+        0.9301638007164001,
+        0.8301308155059814,
+        0.7363680601119995,
+        0.31153377890586853,
+        0.5281381011009216,
+        0.4708106219768524,
+        0.5472404360771179,
+        0.4441572427749634,
+        0.7537984251976013,
+        0.8134675025939941,
+        2.722464084625244,
+        0.26958367228507996,
+        0.28751397132873535,
+        0.38086366653442383,
+        0.5761855840682983,
+        0.6507266163825989,
+        0.2568707764148712
+    ],
+    "used_paths": [
+        "data/raw/calibration\\IMG_8352.JPG",
+        "data/raw/calibration\\IMG_8353.JPG",
+        "data/raw/calibration\\IMG_8354.JPG",
+        "data/raw/calibration\\IMG_8355.JPG",
+        "data/raw/calibration\\IMG_8356.JPG",
+        "data/raw/calibration\\IMG_8357.JPG",
+        "data/raw/calibration\\IMG_8358.JPG",
+        "data/raw/calibration\\IMG_8359.JPG",
+        "data/raw/calibration\\IMG_8360.JPG",
+        "data/raw/calibration\\IMG_8361.JPG",
+        "data/raw/calibration\\IMG_8362.JPG",
+        "data/raw/calibration\\IMG_8363.JPG",
+        "data/raw/calibration\\IMG_8364.JPG",
+        "data/raw/calibration\\IMG_8365.JPG",
+        "data/raw/calibration\\IMG_8366.JPG",
+        "data/raw/calibration\\IMG_8367.JPG",
+        "data/raw/calibration\\IMG_8368.JPG",
+        "data/raw/calibration\\IMG_8369.JPG",
+        "data/raw/calibration\\IMG_8370.JPG",
+        "data/raw/calibration\\IMG_8371.JPG",
+        "data/raw/calibration\\IMG_8372.JPG",
+        "data/raw/calibration\\IMG_8373.JPG"
+    ],
+    "rejected_paths": [],
+    "board_size": [
+        9,
+        6
+    ],
+    "square_size_mm": 28.0,
+    "meta": {
+        "description": "Camera calibration data for LLD gait analysis",
+        "device": "Phone/Camera RGB",
+        "fps": 60
+    }
+}

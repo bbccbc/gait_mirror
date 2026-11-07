@@ -1,0 +1,12 @@
+﻿data/
+videos/
+*.mp4
+*.MOV
+*.mov
+.venv/
+data/
+videos/
+*.mp4
+*.MOV
+*.mov
+.venv/
