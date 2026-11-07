@@ -307,3 +307,115 @@ def build_world_transform(
     t[up_row] = -floor
     return WorldTransform(R=rows, t=t, up_axis=up_axis,
                           floor_height_cam=floor, axes=axes)
+
+# ====================================================================== #
+# CLI, BÁO CÁO NHÂN TRẮC HỌC VÀ LƯU FILE
+# ====================================================================== #
+import argparse
+from pathlib import Path
+import yaml
+
+
+def calculate_anatomical_height(lengths_dict: Dict[str, float]) -> float:
+    """Tính tổng chiều cao giải phẫu từ chuỗi xương (shank + thigh + torso + head)."""
+    shank = np.nanmean([lengths_dict.get("shank_L", np.nan), lengths_dict.get("shank_R", np.nan)])
+    thigh = np.nanmean([lengths_dict.get("thigh_L", np.nan), lengths_dict.get("thigh_R", np.nan)])
+    torso = np.nanmean([lengths_dict.get("torso_L", np.nan), lengths_dict.get("torso_R", np.nan)])
+    
+    # Ước lượng đầu cổ từ tai-mũi + bù đỉnh đầu và mắt cá xuống sàn
+    head = np.nanmean([lengths_dict.get("nose_ear_L", 0.15), lengths_dict.get("nose_ear_R", 0.15)]) + 0.10
+    ankle_to_floor = np.nanmean([lengths_dict.get("ankle_heel_L", 0.07), lengths_dict.get("ankle_heel_R", 0.07)])
+    
+    return float(shank + thigh + torso + head + ankle_to_floor)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Tinh chỉnh 3D Pose cơ sinh học + Căn chỉnh mặt sàn")
+    parser.add_argument("--input_npz", type=str, required=True, help="File DLT 3D thô (vd: IMG_8387_3d.npz)")
+    parser.add_argument("--config_mirror", type=str, default="configs/mirror.yaml", help="Cấu hình gương")
+    parser.add_argument("--output_dir", type=str, default="data/interim/poses_3d/optimized")
+    parser.add_argument("--target_height", type=float, default=None, help="Chiều cao đối tượng (m) để cân chỉnh d toàn cục")
+    parser.add_argument("--up_axis", type=str, default="y", choices=["y", "z"], help="Trục hướng lên trong hệ World")
+    args = parser.parse_args()
+
+    input_path = Path(args.input_npz)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n[1/5] Đang nạp dữ liệu từ {input_path.name}...")
+    data = np.load(input_path, allow_pickle=True)
+    pose_raw = data["pose_3d"].copy()  # (T, 23, 3)
+    reproj_err = data["reproj_err"] if "reproj_err" in data else np.zeros(pose_raw.shape[:2])
+
+    with open(args.config_mirror, "r", encoding="utf-8") as f:
+        m_cfg = yaml.safe_load(f)
+    down_cam = m_cfg.get("vertical_down", [0.0364, 0.9974, 0.0628])
+    d_current = float(m_cfg.get("d", 2.71))
+
+    # ---- 2. Hiệu chỉnh tỉ lệ toàn cục (nếu có target_height) ----
+    scale_factor = 1.0
+    if args.target_height is not None:
+        print(f"\n[2/5] Đang kiểm tra tỉ lệ chiều cao mục tiêu: {args.target_height:.3f} m...")
+        # Tính chiều cao sơ bộ ban đầu
+        b_series = bone_length_series(pose_raw, BONES)
+        init_lengths = {b[0]: float(np.nanmedian(b_series[:, i])) for i, b in enumerate(BONES)}
+        h_init = calculate_anatomical_height(init_lengths)
+        
+        scale_factor = args.target_height / h_init
+        pose_raw *= scale_factor
+        d_equiv = d_current * scale_factor
+        print(f"  -> Chiều cao ước tính thô ban đầu: {h_init:.3f} m")
+        print(f"  -> Hệ số co giãn (scale): {scale_factor:.4f}")
+        print(f"  -> Scale d tương đương cho configs/mirror.yaml: {d_equiv:.4f} m (gốc {d_current} m)")
+    else:
+        print("\n[2/5] Bỏ qua hiệu chỉnh scale (chạy trực tiếp scale từ dLT)...")
+
+    # ---- 3. Tối ưu chuỗi pose ----
+    print("\n[3/5] Đang tối ưu hóa chiều dài xương (Rigid Bone Optimization)...")
+    cfg = RefineConfig()
+    weights = weights_from_reproj(reproj_err, pose_raw, None, cfg)
+    res = refine_pose_sequence(pose_raw, weights, cfg=cfg, bones=BONES)
+    print(f"  -> Hoàn tất tối ưu ({res.nfev} iterations): Cost ban đầu = {res.cost_init:.1f} -> Cost sau tối ưu = {res.cost_final:.1f}")
+
+    # ---- 4. Căn chỉnh hệ trục mặt sàn (World Coordinates) ----
+    print(f"\n[4/5] Đang căn chỉnh mặt sàn theo trọng lực (up_axis='{args.up_axis}')...")
+    w_trans = build_world_transform(res.pose, down_cam=down_cam, up_axis=args.up_axis)
+    pose_world = np.full_like(res.pose, np.nan)
+    valid_mask = np.isfinite(res.pose).all(axis=2)
+    pose_world[valid_mask] = w_trans.apply(res.pose[valid_mask])
+
+    # ---- 5. Báo cáo nhân trắc học & Lưu file ----
+    b_dict = {b[0]: float(res.lengths[i]) for i, b in enumerate(BONES) if np.isfinite(res.lengths[i])}
+    final_height = calculate_anatomical_height(b_dict)
+
+    print("\n" + "="*50)
+    print("BÁO CÁO NHÂN TRẮC HỌC CHI TIẾT SAU KHI REFINEMENT")
+    print("="*50)
+    print(f"{'Đoạn xương':<20} | {'Chiều dài (cm)':<15}")
+    print("-" * 50)
+    for name in ["thigh_L", "thigh_R", "shank_L", "shank_R", "torso_L", "torso_R", "pelvis_width"]:
+        if name in b_dict:
+            print(f"{name:<20} | {b_dict[name]*100:.2f} cm")
+    print("-" * 50)
+    print(f"-> TỔNG CHIỀU CAO GIẢI PHẪU: {final_height:.3f} m ({final_height*100:.1f} cm)")
+    print("="*50)
+
+    # Lưu kết quả
+    stem = input_path.stem.replace("_3d", "")
+    out_file = output_dir / f"{stem}_refined.npz"
+    np.savez_compressed(
+        out_file,
+        pose_3d=pose_world,             # Đã đưa về hệ sàn World (Y=0 là mặt sàn)
+        pose_cam=res.pose,              # Tọa độ trong hệ camera đã nắn xương
+        lengths=res.lengths,            # Độ dài bất biến từng xương
+        bone_names=np.array([b[0] for b in BONES]),
+        target_height=args.target_height if args.target_height else final_height,
+        scale_applied=scale_factor,
+        world_R=w_trans.R,
+        world_t=w_trans.t,
+    )
+    print(f"\n[5/5] ĐÃ LƯU THÀNH CÔNG: {out_file}\n")
+
+
+if __name__ == "__main__":
+    main()
