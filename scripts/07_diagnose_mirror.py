@@ -249,6 +249,27 @@ def main() -> int:
     y_med = float(np.median(X[foot] @ n_g)) if foot.sum() >= 20 else float("nan")
     if cam_height is not None and y_med > 0:
         cands["sàn (có xét chúi)"] = D0 * float(cam_height) / y_med
+    # Khớp mặt sàn trực tiếp từ bàn chân (không dựa vào n_y): bàn chân chạm sàn
+    # tạo cụm điểm rất hẹp theo pháp tuyến sàn; chọn beta làm đuôi trên của
+    # phân bố g = X . n_g(beta) hẹp nhất (p95 - p70), mức sàn = p90.
+    beta_fit: Optional[float] = None
+    if foot.sum() >= 200:
+        gp = X[foot]
+        a_deg = float(np.degrees(alpha))
+        betas = np.arange(a_deg - 10.0, a_deg + 10.0 + 1e-9, 0.25)
+
+        def _g(b_deg: float) -> FloatArray:
+            b = np.deg2rad(b_deg)
+            return gp @ np.array([0.0, np.cos(b), np.sin(b)])
+
+        widths = [float(np.percentile(_g(b), 95) - np.percentile(_g(b), 70))
+                  for b in betas]
+        beta_fit = float(betas[int(np.argmin(widths))])
+        h0 = float(np.percentile(_g(beta_fit), 90))
+        LOG.info("Khớp sàn từ bàn chân: beta=%.2f deg (so với %.2f deg suy từ n_y; "
+                 "chênh %.2f deg).", beta_fit, a_deg, beta_fit - a_deg)
+        if cam_height is not None and h0 > 0:
+            cands["sàn khớp từ bàn chân"] = D0 * float(cam_height) / h0
     if setup.get("camera_to_mirror") is not None:
         cands["thước dây x |n_z|"] = float(setup["camera_to_mirror"]) * abs(n_best[2])
     if setup.get("walkway_length") is not None:
