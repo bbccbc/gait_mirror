@@ -71,7 +71,7 @@ BONES: List[Tuple[str, int, int, str]] = [
 
 @dataclass
 class RefineConfig:
-    """Siêu tham số (mét). w = 1 / sigma^2 so với công thức E trong đề bài."""
+    """Siêu tham số tối ưu hóa cơ sinh học (đơn vị mét)."""
 
     sigma_data_m: float = 0.03
     sigma_bone_m: float = 0.004
@@ -80,7 +80,14 @@ class RefineConfig:
     reproj_ref_px: float = 3.0
     gap_fill_weight: float = 0.25
     min_joint_valid_ratio: float = 0.05
-    max_nfev: int = 60
+    max_nfev: int = 80
+
+    # --- RÀNG BUỘC NHÂN TRẮC HỌC KHẮC PHỤC LỖI ÁO THỤNG ---
+    # Khớp háng (11, 12) dễ bị nhiễu khi mặc áo thụng: hạ trọng số bám DLT
+    # để optimizer ưu tiên tỉ lệ cơ thể hơn là bám sát tọa độ thô.
+    hip_weight_factor: float = 0.15      # Nhân trọng số háng (0 < x <= 1)
+    target_shank_thigh_ratio: float = 0.85  # Tỉ lệ cẳng chân / đùi (~0.83–0.86)
+    sigma_ratio_m: float = 0.005         # Độ siết ràng buộc tỉ lệ (mét)
 
 
 @dataclass
@@ -101,13 +108,22 @@ def weights_from_reproj(
     gap_filled: Optional[BoolArray],
     cfg: RefineConfig,
 ) -> FloatArray:
-    """Trọng số bám dữ liệu w_tj in [0,1] từ sai số tái chiếu 2 view (px)."""
+    """Trọng số bám dữ liệu w_tj, nới lỏng riêng cho khớp háng (11, 12).
+
+    Khớp háng thường bị che khuất bởi quần áo rộng (áo thụng) làm detection
+    sai lệch. Hạ hệ số ``hip_weight_factor`` để optimizer ưu tiên ràng buộc
+    tỉ lệ cơ thể hơn là bám sát tọa độ DLT thô tại hai khớp này.
+    """
     err = np.nanmean(reproj, axis=2) if reproj.ndim == 3 else reproj
     w = 1.0 / (1.0 + (err / cfg.reproj_ref_px) ** 2)
     finite = np.isfinite(pose).all(axis=2)
     w = np.where(np.isfinite(w), w, cfg.gap_fill_weight)  # nội suy: tin ít
     if gap_filled is not None:
         w = np.where(gap_filled, cfg.gap_fill_weight, w)
+
+    # Nới lỏng bám DLT ở khớp háng để ưu tiên tỉ lệ cơ thể
+    w[:, list(HIP_IDS)] *= cfg.hip_weight_factor
+
     return np.where(finite, w, 0.0)
 
 
@@ -117,7 +133,15 @@ def refine_pose_sequence(
     cfg: Optional[RefineConfig] = None,
     bones: Sequence[Tuple[str, int, int, str]] = BONES,
 ) -> RefineResult:
-    """Tối ưu toàn chuỗi. pose: (T, J, 3) NaN = thiếu; weights: (T, J) >= 0."""
+    """Tối ưu toàn chuỗi. pose: (T, J, 3) NaN = thiếu; weights: (T, J) >= 0.
+
+    Hàm mục tiêu có 3 nhóm số hạng (+ 2 ràng buộc nhân trắc học mới):
+      - Bám DLT:    weighted || p_tj - d_tj || / sd
+      - Xương:      (||p_b1 - p_b2|| - L_b) / sbn  (Trái/Phải độc lập cho LLD)
+      - Mượt:       (p_{t-1} - 2 p_t + p_{t+1}) / ss_j
+      - Tỉ lệ L:    (L_shank_L - ratio * L_thigh_L) / sigma_ratio
+      - Tỉ lệ R:    (L_shank_R - ratio * L_thigh_R) / sigma_ratio  (độc lập Trái/Phải)
+    """
     cfg = cfg or RefineConfig()
     t_len, n_j, _ = pose.shape
     valid = np.isfinite(pose).all(axis=2) & (weights > 0)
@@ -129,7 +153,7 @@ def refine_pose_sequence(
     x0_pts = pose[valid].astype(np.float64)
     w_pt = np.sqrt(weights[valid])
 
-    # ---- xương: các cặp (t, b) có đủ hai đầu ----
+    # ---- Xương: các cặp (t, b) ----
     b1 = np.array([b[1] for b in bones])
     b2 = np.array([b[2] for b in bones])
     n_b = len(bones)
@@ -145,14 +169,24 @@ def refine_pose_sequence(
     keep_b = np.isfinite(lengths0[bb])
     ia, ib, bb = ia[keep_b], ib[keep_b], bb[keep_b]
 
-    # ---- mượt: bộ ba (t-1, t, t+1) cùng khớp ----
+    # ---- Mượt thời gian ----
     p_a, p_b, p_c = pid[:-2], pid[1:-1], pid[2:]
     ts, js = np.nonzero((p_a >= 0) & (p_b >= 0) & (p_c >= 0))
     sa, sb_, sc = p_a[ts, js], p_b[ts, js], p_c[ts, js]
     feet = np.isin(js, FEET_SMOOTH_IDS)
     sig_s = cfg.sigma_smooth_m * np.where(feet, cfg.feet_smooth_factor, 1.0)
 
+    # ---- Lấy index xương đùi/cẳng để ràng buộc tỉ lệ (Trái/Phải độc lập) ----
+    bone_names = [b[0] for b in bones]
+    idx_thigh_L = bone_names.index("thigh_L")
+    idx_shank_L = bone_names.index("shank_L")
+    idx_thigh_R = bone_names.index("thigh_R")
+    idx_shank_R = bone_names.index("shank_R")
+
     sd, sbn = cfg.sigma_data_m, cfg.sigma_bone_m
+    sig_ratio = cfg.sigma_ratio_m
+    ratio_target = cfg.target_shank_thigh_ratio
+
     n_x = 3 * n_v
     x_init = np.concatenate([x0_pts.ravel(), np.nan_to_num(lengths0, nan=0.0)])
     n_data, n_bone, n_sm = 3 * n_v, len(ia), 3 * len(sa)
@@ -164,19 +198,25 @@ def refine_pose_sequence(
         dn = np.linalg.norm(pts[ia] - pts[ib], axis=1)
         r_bone = (dn - lens[bb]) / sbn
         r_sm = ((pts[sa] - 2.0 * pts[sb_] + pts[sc]) / sig_s[:, None]).ravel()
-        return np.concatenate([r_data, r_bone, r_sm])
+        # Ràng buộc tỉ lệ cẳng/đùi — Trái và Phải độc lập (không ép đối xứng LLD)
+        r_ratio_L = (lens[idx_shank_L] - ratio_target * lens[idx_thigh_L]) / sig_ratio
+        r_ratio_R = (lens[idx_shank_R] - ratio_target * lens[idx_thigh_R]) / sig_ratio
+        r_ratio = np.array([r_ratio_L, r_ratio_R], dtype=np.float64)
+        return np.concatenate([r_data, r_bone, r_sm, r_ratio])
 
     def jac(x: FloatArray) -> sparse.csr_matrix:
         pts = x[:n_x].reshape(n_v, 3)
         rows: List[NDArray] = []
         cols: List[NDArray] = []
         vals: List[NDArray] = []
-        # data
+
+        # 1. Data jacobian
         idx = np.arange(n_x)
         rows.append(idx)
         cols.append(idx)
         vals.append(np.repeat(w_pt / sd, 3))
-        # bone
+
+        # 2. Bone jacobian
         base = n_data
         dv = pts[ia] - pts[ib]
         dn = np.maximum(np.linalg.norm(dv, axis=1), 1e-9)
@@ -192,7 +232,8 @@ def refine_pose_sequence(
         rows.append(r_idx)
         cols.append(n_x + bb)
         vals.append(np.full(n_bone, -1.0 / sbn))
-        # smooth
+
+        # 3. Smooth jacobian
         base = n_data + n_bone
         s_idx = base + np.arange(len(sa))[:, None] * 3 + np.arange(3)[None, :]
         for pidx, coef in ((sa, 1.0), (sb_, -2.0), (sc, 1.0)):
@@ -200,7 +241,19 @@ def refine_pose_sequence(
             rows.append(s_idx.ravel())
             cols.append(c_idx.ravel())
             vals.append(np.repeat(coef / sig_s, 3))
-        n_rows = n_data + n_bone + n_sm
+
+        # 4. Anthropometric ratio jacobian (2 hàng: Trái, Phải)
+        base_ratio = n_data + n_bone + n_sm
+        # Hàng 0: shank_L - ratio * thigh_L = 0
+        rows.append(np.array([base_ratio, base_ratio]))
+        cols.append(np.array([n_x + idx_shank_L, n_x + idx_thigh_L]))
+        vals.append(np.array([1.0 / sig_ratio, -ratio_target / sig_ratio]))
+        # Hàng 1: shank_R - ratio * thigh_R = 0
+        rows.append(np.array([base_ratio + 1, base_ratio + 1]))
+        cols.append(np.array([n_x + idx_shank_R, n_x + idx_thigh_R]))
+        vals.append(np.array([1.0 / sig_ratio, -ratio_target / sig_ratio]))
+
+        n_rows = n_data + n_bone + n_sm + 2
         return sparse.coo_matrix(
             (np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
             shape=(n_rows, n_x + n_b),
