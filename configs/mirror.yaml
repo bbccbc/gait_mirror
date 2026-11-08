@@ -1,7 +1,7 @@
 mirror:
   image_side: right
   normal: [-0.8588, 0.0634, -0.5084]
-  d: 2.71
+  d: 2.46
   vertical_down: [0.0364, 0.9974, 0.0628]
 
 setup:
