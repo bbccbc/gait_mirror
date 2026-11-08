@@ -80,7 +80,9 @@ class RefineConfig:
     reproj_ref_px: float = 3.0
     gap_fill_weight: float = 0.25
     min_joint_valid_ratio: float = 0.05
-    max_nfev: int = 60
+    max_nfev: int = 150
+    loss: str = "soft_l1"  # robust: điểm ngoại lai không kéo độ dài xương lên
+    f_scale: float = 3.0  # ngưỡng (đơn vị sigma) bắt đầu giảm trọng số
 
 
 @dataclass
@@ -102,7 +104,11 @@ def weights_from_reproj(
     cfg: RefineConfig,
 ) -> FloatArray:
     """Trọng số bám dữ liệu w_tj in [0,1] từ sai số tái chiếu 2 view (px)."""
-    err = np.nanmean(reproj, axis=2) if reproj.ndim == 3 else reproj
+    if reproj.ndim == 3:
+        cnt = np.isfinite(reproj).sum(axis=2)
+        err = np.where(cnt > 0, np.nansum(reproj, axis=2) / np.maximum(cnt, 1), np.nan)
+    else:
+        err = reproj
     w = 1.0 / (1.0 + (err / cfg.reproj_ref_px) ** 2)
     finite = np.isfinite(pose).all(axis=2)
     w = np.where(np.isfinite(w), w, cfg.gap_fill_weight)  # nội suy: tin ít
@@ -209,6 +215,7 @@ def refine_pose_sequence(
     cost0 = 0.5 * float(np.sum(fun(x_init) ** 2))
     sol = least_squares(
         fun, x_init, jac=jac, method="trf", tr_solver="lsmr", x_scale="jac",
+        loss=cfg.loss, f_scale=cfg.f_scale,
         max_nfev=cfg.max_nfev, ftol=1e-6, xtol=1e-8, gtol=1e-8,
     )
     out = np.full_like(pose, np.nan, dtype=np.float64)
@@ -217,7 +224,8 @@ def refine_pose_sequence(
     lengths[~np.isfinite(lengths0)] = np.nan
     return RefineResult(
         pose=out, lengths=lengths, lengths_init=lengths0, valid=valid,
-        cost_init=cost0, cost_final=float(sol.cost), nfev=int(sol.nfev),
+        cost_init=cost0, cost_final=0.5 * float(np.sum(fun(sol.x) ** 2)),
+        nfev=int(sol.nfev),
         message=str(sol.message),
     )
 

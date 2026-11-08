@@ -146,6 +146,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sigma_smooth_m", type=float, default=None)
     p.add_argument("--feet_smooth_factor", type=float, default=None)
     p.add_argument("--max_nfev", type=int, default=None)
+    p.add_argument("--loss", choices=["linear", "soft_l1", "huber", "cauchy"], default=None)
+    p.add_argument("--f_scale", type=float, default=None)
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args()
 
@@ -168,7 +170,7 @@ def main() -> int:
         if hasattr(rcfg, k):
             setattr(rcfg, k, type(getattr(rcfg, k))(v))
     for name in ("sigma_data_m", "sigma_bone_m", "sigma_smooth_m",
-                 "feet_smooth_factor", "max_nfev"):
+                 "feet_smooth_factor", "max_nfev", "loss", "f_scale"):
         v = getattr(args, name)
         if v is not None:
             setattr(rcfg, name, type(getattr(rcfg, name))(v))
@@ -216,6 +218,8 @@ def main() -> int:
     res = refine_pose_sequence(pose_in, w, rcfg)
     LOG.info("Tối ưu: cost %.4g -> %.4g, nfev=%d (%s)", res.cost_init,
              res.cost_final, res.nfev, res.message)
+    if res.nfev >= rcfg.max_nfev:
+        LOG.warning("Chưa hội tụ (đạt max_nfev=%d): tăng --max_nfev.", rcfg.max_nfev)
     len_ref = bone_length_series(res.pose)
 
     # ---- hệ World ----
@@ -229,6 +233,8 @@ def main() -> int:
 
     scale = 1.0
     d_cfg = mir.get("d")
+    len_dlt_med = np.array([_nanmed(len_dlt[:, i]) for i in range(len_dlt.shape[1])])
+    st_med = stature_estimate(pose_dlt_w, len_dlt_med, up_idx, args.head_top_m)
     stature_pre = st["stature"]
     cam_h_pre = -tf.floor_height_cam
     cfg_cam_h = (cfg_yaml.get("setup", {}) or {}).get("camera_height")
@@ -236,14 +242,18 @@ def main() -> int:
         print("\n=== d suy ra từ dữ liệu (so với cạnh gương / chiều dài đường đi) ===")
         print(f"  d đang dùng cho pose này              : {d_in:.3f} m")
         if subj_h:
-            print(f"  từ chiều cao đối tượng ({float(subj_h):.3f} m)      : "
+            print(f"  từ chiều cao, theo L sau tối ưu       : "
                   f"{d_in * float(subj_h) / stature_pre:.3f} m   "
-                  f"(chiều cao ước lượng hiện tại {stature_pre:.3f} m, công thức ~±3%)")
+                  f"(chiều cao ước lượng {stature_pre:.3f} m)")
+            print(f"  từ chiều cao, theo MEDIAN DLT thô     : "
+                  f"{d_in * float(subj_h) / st_med['stature']:.3f} m   "
+                  f"(chiều cao ước lượng {st_med['stature']:.3f} m; kháng nhiễu hơn; công thức ~±3%)")
         if cfg_cam_h:
             print(f"  từ chiều cao camera ({float(cfg_cam_h):.3f} m)       : "
                   f"{d_in * float(cfg_cam_h) / cam_h_pre:.3f} m   "
                   f"(camera cao suy ra hiện tại {cam_h_pre:.3f} m; nhạy với vertical_down)")
-        print("  Nếu các nguồn khớp nhau trong ~3% thì sửa d trong mirror.yaml rồi chạy lại 03.\n")
+        print("  Nguồn 'camera cao' chỉ đáng tin nếu vertical_down và camera_height đều đúng;")
+        print("  nếu lệch nhiều so với các nguồn khác thì đừng dùng nó để chọn d.\n")
     if subj_h:
         ratio = float(subj_h) / st["stature"]
         LOG.info("Chiều cao ước lượng %.3f m so với đối tượng %.3f m: tỉ lệ %.4f",
