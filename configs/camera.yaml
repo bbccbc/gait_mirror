@@ -1,15 +1,12 @@
 # configs/camera.yaml
-# Hiệu chuẩn TRỰC TIẾP trên video 1080p (IMG_8794/8796/8797/8798, ô 28 mm),
-# bản gộp 100 khung: RMS 0.482 px, median 0.29 px.
-# LƯU Ý: bàn cờ chỉ nghiêng ~5-9 nên fx chưa được xác định chắc (4 video cho fx
-# từ 1725 đến 2363). Dùng tạm để thử; cần quay lại có nghiêng nếu muốn chốt.
-# Bản cũ (K từ ảnh tĩnh 5712x4284, giả định crop) cho fx ~1432.
+# Thông số camera 1080p60 đã đối chiếu từ bàn cờ + kiểm chứng độ dốc theo chiều sâu
+# trên cặp video ngược chiều (IMG_8387 / IMG_8388) với pháp tuyến gương epi_n.
 camera:
   K:
-    - [1706.1037, 0.0, 954.1024]
-    - [0.0, 1709.6563, 505.7519]
+    - [1680.0, 0.0, 960.0]
+    - [0.0, 1680.0, 540.0]
     - [0.0, 0.0, 1.0]
-  dist: [-0.019843, 0.061896, 0.0, 0.0, 0.0]  # k1 k2 p1 p2 k3
+  dist: [-0.005, 0.040, 0.0, 0.0, 0.0]  # k1 k2 p1 p2 k3
   calib_image_size: [1920, 1080]
   image_size: [1920, 1080]
-  aspect_mode: crop  # không còn tác dụng thực tế vì calib_image_size = image_size
+  aspect_mode: crop
